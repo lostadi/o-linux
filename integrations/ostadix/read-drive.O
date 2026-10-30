@@ -1,0 +1,11 @@
+python^(
+import os
+import sys
+from pathlib import Path
+
+state = Path(os.environ.get("O_LINUX_STATE", str(Path.home() / ".local/share/o-linux"))).expanduser().resolve()
+sys.path.insert(0, str(state / "app/src"))
+from olinux.drive_frontend import open_request
+
+__oval_result__ = open_request()
+)_python

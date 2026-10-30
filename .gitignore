@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Installation state and local evidence belong outside the source checkout.
+/.state/
+/.runtime/
+/state/
+/private/
+/evidence/
+/runs/
+/backups/
+/app/
+/cloud-init.yaml
+config.json
+drives.json
+drives.lock
+install-transaction.json
+authorized_keys
+*_known_hosts
+*_id_ed25519*
+*.pem
+*.key
+*.log
+nbd_state.json
+
+# Disk images and recovery material are never publication inputs.
+*.raw
+*.img
+*.qcow2
+*.iso
+# Local automation history is never part of the package.
+/.remember/
