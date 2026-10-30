@@ -38,8 +38,9 @@ class GuestDriveTests(unittest.TestCase):
         self.local_drive = self.stack.enter_context(patch.object(drives, "main"))
 
     def test_each_action_uses_absolute_host_command_and_preserves_arguments(self):
-        actions = [[], ["open"], ["status"], ["close"],
-                   ["select", "/dev/disk9s3", "--mountpoint", "/Volumes/a b $(literal) 'quoted'"]]
+        actions = [[], ["open"], ["status"], ["close"], ["mode", "rw"], ["mode", "ro"],
+                   ["select", "/dev/disk9s3", "--mountpoint", "/Volumes/a b $(literal) 'quoted'", "--read-write"],
+                   ["select", "/dev/disk9s3", "--read-only"]]
         with patch.object(guest_mac, "main", return_value=23) as bridge, \
                 patch.object(cli.shutil, "which", side_effect=AssertionError("PATH must not select the bridge")):
             for arguments in actions:
@@ -147,8 +148,9 @@ class GuestDriveTests(unittest.TestCase):
             self.local_drive.return_value = 9
             for arguments in ([], ["open"]):
                 self.assertEqual(cli.main(["_host-drive", *arguments]), 0)
-            for arguments in (["status"], ["close"],
-                              ["select", "/dev/disk9s3", "--mountpoint", "/Volumes/a b"]):
+            for arguments in (["status"], ["close"], ["mode", "rw"], ["mode", "ro"],
+                              ["select", "/dev/disk9s3", "--mountpoint", "/Volumes/a b", "--read-write"],
+                              ["select", "/dev/disk9s3", "--read-only"]):
                 self.assertEqual(cli.main(["_host-drive", *arguments]), 9)
                 self.local_drive.assert_called_with(arguments)
         forward.assert_not_called()

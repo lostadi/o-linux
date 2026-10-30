@@ -232,20 +232,142 @@ def guest_host_network(config):
     raise RuntimeError("Cannot establish the guest subnet for the host SSH key")
 
 
-def mount_plan(config):
-    """Reject conflicts before changing an existing installation."""
+def current_mounts(config):
     info = json.loads(run([config["multipass"], "info", config["instance"], "--format", "json"]).stdout)["info"][config["instance"]]
+    mounts = info.get("mounts", {})
+    if not isinstance(mounts, dict):
+        raise RuntimeError("Unrecognized Multipass mount metadata")
+    return mounts
+
+
+def id_mappings(values):
+    """Retain declared defaults until the guest account IDs have been resolved."""
+    if not isinstance(values, list) or not values:
+        raise RuntimeError("Missing or invalid share ID mappings")
+    result, hosts, guests = [], set(), set()
+    for value in values:
+        match = re.fullmatch(r"([0-9]+):(default|[0-9]+)", value) if isinstance(value, str) else None
+        if not match:
+            raise RuntimeError("Invalid share ID mapping: " + repr(value))
+        host = str(int(match[1]))
+        guest_id = "default" if match[2] == "default" else str(int(match[2]))
+        if int(host) >= 2 ** 32 or (guest_id != "default" and int(guest_id) >= 2 ** 32):
+            raise RuntimeError("Share ID mapping is outside the supported numeric range")
+        if host in hosts or guest_id in guests:
+            raise RuntimeError("Share ID mappings must be one-to-one")
+        hosts.add(host); guests.add(guest_id)
+        result.append(host + ":" + guest_id)
+    return sorted(result, key=lambda value: int(value.split(":", 1)[0]))
+
+
+def root_mapping(values):
+    result = id_mappings(values)
+    if "0:0" in result:
+        return result
+    if any(value.startswith("0:") or value.endswith(":0") for value in result):
+        raise RuntimeError("Existing share ID mapping conflicts with root 0:0")
+    return id_mappings([*result, "0:0"])
+
+
+def mount_identity(value):
+    if not isinstance(value, dict) or not isinstance(value.get("source_path"), str):
+        raise RuntimeError("Unrecognized share identity")
+    return {"source_path": value["source_path"],
+            "uid_mappings": id_mappings(value.get("uid_mappings")),
+            "gid_mappings": id_mappings(value.get("gid_mappings"))}
+
+
+def mount_plan(config, retained=()):
+    """Plan only the configured shares, retaining mappings across interrupted upgrades."""
+    mounts = current_mounts(config)
     shares = [(config["host_home"], config["host_home"])]
     if config["share_volumes"]:
         shares.append(("/Volumes", "/Volumes"))
-    missing = []
+    planned = []
     for source, target in shares:
-        current = info.get("mounts", {}).get(target)
+        current = mounts.get(target)
         if current and current["source_path"] != source:
             raise RuntimeError("A different source is already mounted at " + target)
-        if not current:
-            missing.append((source, target))
-    return missing
+        if current and not config.get("share_root", False):
+            continue
+        previous = mount_identity(current) if current else None
+        saved = [item for item in retained if isinstance(item, dict)
+                 and item.get("target") == target and item.get("source") == source]
+        if len(saved) > 1:
+            raise RuntimeError("Ambiguous retained share mappings for " + target)
+        desired = (previous or saved[0]) if previous or saved else {
+            "uid_mappings": [str(os.getuid()) + ":default"],
+            "gid_mappings": [str(os.getgid()) + ":default"]}
+        uids = id_mappings(desired.get("uid_mappings"))
+        gids = id_mappings(desired.get("gid_mappings"))
+        if config.get("share_root", False):
+            uids, gids = root_mapping(uids), root_mapping(gids)
+        if previous and uids == previous["uid_mappings"] and gids == previous["gid_mappings"]:
+            continue
+        planned.append({"source": source, "target": target, "uid_mappings": uids,
+                        "gid_mappings": gids, "previous": previous, "state": "planned"})
+    return planned
+
+
+def resolved_mappings(values, guest_id):
+    return id_mappings([value.replace(":default", ":" + str(guest_id)) for value in id_mappings(values)])
+
+
+def apply_mount_plan(config, state, transaction, plans):
+    if not plans:
+        return
+    # Multipass accepts numeric CLI mappings, although info prints "default".
+    ids = []
+    for flag in ("-u", "-g"):
+        value = guest(config, ["id", flag, config["guest_user"]]).stdout.strip()
+        if not re.fullmatch(r"[0-9]+", value) or not 0 < int(value) < 2 ** 32:
+            raise RuntimeError("Cannot resolve the non-root guest account for share mappings")
+        ids.append(int(value))
+    current = current_mounts(config)
+    for plan in plans:
+        found = current.get(plan["target"])
+        if (mount_identity(found) if found else None) != plan["previous"]:
+            raise RuntimeError("Share changed before its planned update: " + plan["target"])
+        plan["resolved_uids"] = resolved_mappings(plan["uid_mappings"], ids[0])
+        plan["resolved_gids"] = resolved_mappings(plan["gid_mappings"], ids[1])
+    targets = {plan["target"] for plan in plans}
+    transaction["mount_operations"] = [item for item in transaction.get("mount_operations", [])
+                                        if item.get("target") not in targets] + plans
+    record_transaction(state, transaction, "shared-directories")
+    for plan in plans:
+        target = config["instance"] + ":" + plan["target"]
+        found = current_mounts(config).get(plan["target"])
+        if (mount_identity(found) if found else None) != plan["previous"]:
+            raise RuntimeError("Share changed before its update: " + plan["target"])
+        if plan["previous"] is not None:
+            plan["state"] = "unmounting"
+            record_transaction(state, transaction, "shared-directories")
+            found = current_mounts(config).get(plan["target"])
+            if (mount_identity(found) if found else None) != plan["previous"]:
+                raise RuntimeError("Share changed after recording unmount intent: " + target)
+            run([config["multipass"], "umount", target], timeout=180)
+            if current_mounts(config).get(plan["target"]):
+                raise RuntimeError("Share unmount completion is unverified: " + target)
+            plan["state"] = "detached"
+            record_transaction(state, transaction, "shared-directories")
+        if current_mounts(config).get(plan["target"]):
+            raise RuntimeError("Share destination became occupied: " + target)
+        plan["state"] = "mounting"
+        record_transaction(state, transaction, "shared-directories")
+        if current_mounts(config).get(plan["target"]):
+            raise RuntimeError("Share destination became occupied after recording mount intent: " + target)
+        argv = [config["multipass"], "mount", plan["source"], target]
+        for flag, values in (("-u", plan["resolved_uids"]), ("-g", plan["resolved_gids"])):
+            for value in values:
+                argv.extend([flag, value])
+        run(argv, timeout=180)
+        mounted = mount_identity(current_mounts(config).get(plan["target"]))
+        if (mounted["source_path"] != plan["source"]
+                or resolved_mappings(mounted["uid_mappings"], ids[0]) != plan["resolved_uids"]
+                or resolved_mappings(mounted["gid_mappings"], ids[1]) != plan["resolved_gids"]):
+            raise RuntimeError("Updated share mapping was not verified: " + target)
+        plan["state"] = "mounted"
+        record_transaction(state, transaction, "shared-directories")
 
 
 def record_transaction(state, transaction, phase, status="incomplete", error=None):
@@ -348,10 +470,13 @@ def make_config(args, old=None):
               "qemu_nbd": old.get("qemu_nbd") or shutil.which("qemu-nbd"),
               "guest_host_alias": "o-linux-guest", "host_alias": "o-linux-mac",
               "share_volumes": args.share_volumes if args.share_volumes is not None else old.get("share_volumes", True),
+              "share_root": args.share_root if args.share_root is not None else old.get("share_root", False),
               "cpus": args.cpus if args.cpus is not None else old.get("cpus", 4),
               "memory": args.memory if args.memory is not None else old.get("memory", "4G"),
               "disk": args.disk if args.disk is not None else old.get("disk", "16G"),
               "release": args.release if args.release is not None else old.get("release", "26.04")})
+    if type(result["share_root"]) is not bool:
+        raise RuntimeError("Saved share_root must be a boolean")
     if old:
         if old.get("provider", "multipass") != "multipass":
             raise RuntimeError("Existing configuration uses a different provider; use a separate O_LINUX_STATE")
@@ -377,7 +502,9 @@ def main(argv=None):
     volumes = parser.add_mutually_exclusive_group()
     volumes.add_argument("--no-volumes", action="store_false", dest="share_volumes", help="do not add a /Volumes mapping; existing mappings are preserved")
     volumes.add_argument("--volumes", action="store_true", dest="share_volumes", help="add a /Volumes mapping")
-    parser.set_defaults(share_volumes=None)
+    parser.add_argument("--map-root", action="store_true", dest="share_root",
+                        help="also map UID/GID 0 to guest root within managed home and /Volumes shares")
+    parser.set_defaults(share_volumes=None, share_root=None)
     args = parser.parse_args(argv)
     transaction = None
     try:
@@ -385,6 +512,13 @@ def main(argv=None):
         existing = state / "config.json"
         old = json.loads(existing.read_text()) if existing.exists() else None
         config = make_config(args, old)
+        prior_path = state / "install-transaction.json"
+        prior = json.loads(prior_path.read_text()) if prior_path.exists() else {}
+        if not isinstance(prior, dict):
+            raise RuntimeError("Invalid installation transaction")
+        retained = prior.get("mount_operations", []) if prior.get("instance") == config["instance"] else []
+        if not isinstance(retained, list) or any(not isinstance(item, dict) for item in retained):
+            raise RuntimeError("Invalid retained share mapping transaction")
         if config["cpus"] < 1 or not re.fullmatch(r"[1-9][0-9]*(?:[.][0-9]+)?[MG]", config["memory"]) or not re.fullmatch(r"[1-9][0-9]*G", config["disk"]):
             raise ValueError("Use a positive CPU count, memory such as 4G, and disk such as 16G")
         if not config["release"] or config["release"].startswith("-"):
@@ -421,7 +555,7 @@ def main(argv=None):
         if selected and not old and not args.adopt_existing:
             raise RuntimeError("The instance exists; use --adopt-existing to configure it deliberately")
         if selected:
-            mount_plan(config)
+            mount_plan(config, retained)
         state.mkdir(mode=0o700, parents=True, exist_ok=True)
         with (state / "install.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -431,8 +565,11 @@ def main(argv=None):
                      "--memory", config["memory"], "--disk", config["disk"], "--release", config["release"]]
             if not config["share_volumes"]:
                 retry.append("--no-volumes")
+            if config["share_root"]:
+                retry.append("--map-root")
             transaction = {"schema": 1, "instance": config["instance"], "state": str(state),
                            "started_at": time.time(), "retry_argv": retry,
+                           "mount_operations": retained,
                            "retry_environment": {"O_LINUX_STATE": str(state)},
                            "recovery": "Rerun retry_argv with retry_environment. Setup preserves keys and unrelated authorized_keys entries; no VM disk is replaced. Local and guest backups are retained."}
             record_transaction(state, transaction, "guest-start")
@@ -447,7 +584,7 @@ def main(argv=None):
                 if selected["state"] not in ("Stopped", "Suspended"):
                     raise RuntimeError("The selected VM is in state " + selected["state"])
                 run([config["multipass"], "start", config["instance"]], timeout=180)
-            shares = mount_plan(config)
+            shares = mount_plan(config, retained)
             record_transaction(state, transaction, "guest-readiness")
             guest(config, ["cloud-init", "status", "--wait"], timeout=600)
             # Adopted guests must have the storage prerequisites used by the interface.
@@ -473,8 +610,7 @@ def main(argv=None):
             record_transaction(state, transaction, "guest-provision")
             provision_guest(config, state, shell_public, host_public)
             record_transaction(state, transaction, "shared-directories")
-            for source, target in shares:
-                run([config["multipass"], "mount", source, config["instance"] + ":" + target], timeout=180)
+            apply_mount_plan(config, state, transaction, shares)
             record_transaction(state, transaction, "bridge-verification")
             answer = guest(config, ["/usr/local/bin/mac", "uname", "-s"]).stdout.strip()
             if answer != "Darwin":

@@ -1,4 +1,4 @@
-"""A contained O declaration followed by one explicit native read-only operation."""
+"""A contained O declaration followed by a native open in the saved access mode."""
 import hashlib
 import json
 import os
@@ -15,7 +15,7 @@ from .config import load_config, state_dir
 from .install import atomic_write
 from .ostadix import environment
 
-SCHEMA = "o-linux.drive-request/v1"
+SCHEMA = "o-linux.drive-request/v2"
 NONCE_ENV = "O_LINUX_DRIVE_NONCE"
 
 
@@ -25,7 +25,9 @@ def selection_hash(selection):
 
 
 def request_for(selection, nonce):
-    return {"schema": SCHEMA, "action": "open-readonly", "installation": str(state_dir()),
+    mode = drives.access_mode(selection)
+    action = "open-readonly" if mode == "ro" else "open-readwrite"
+    return {"schema": SCHEMA, "action": action, "access_mode": mode, "installation": str(state_dir()),
             "selection_sha256": selection_hash(selection), "nonce": nonce}
 
 
@@ -70,7 +72,7 @@ def run_open():
         receipt_path = directory / "receipt.json"
         receipt = {"schema": "o-linux.drive-operation/v1", "state": "declaring", "request": expected,
                    "document": str(document), "document_sha256": digest,
-                   "authority": "native-caller; fixed-read-only-operation"}
+                   "authority": "native-caller; fixed-open-operation; access-mode=" + expected["access_mode"]}
         def save():
             atomic_write(receipt_path, json.dumps(receipt, indent=2) + "\n")
         save()
@@ -99,7 +101,8 @@ def run_open():
             receipt["state"] = "native-operation"; save()
             # Do not use request-supplied argv, paths, options or privileges.
             # operate re-reads the selected profile and verifies physical and
-            # mounted identities. This caller already holds the profile lock.
+            # mounted identities and the saved access mode. This caller already
+            # holds the profile lock; O cannot supply a mode override.
             native_dispatched = True
             opened = drives.operate(SimpleNamespace(action="open"))
             receipt.update(state="completed", result=opened); save()

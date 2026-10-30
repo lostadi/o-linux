@@ -23,11 +23,15 @@ o-linux systems --linux [ARGS...] Run that laboratory inside Linux through O
 o-linux inventory [CATEGORY]    Native host peripheral metadata
 o-linux disks                  Host external-disk metadata
 o-linux drive [open|status|select DEVICE|close]
-                               Remember and open a drive read-only through O
+                               Remember and open a drive through O in its saved mode
+o-linux drive mode rw|ro        Save the access mode while the selected drive is closed
+o-linux drive select DEVICE [--read-write|--read-only]
+                               New selections use read-write unless explicitly read-only
 o-linux mac [ARGS...]           Native Mac command from the Linux guest
-o-linux image IMAGE.raw         Read-only image bridge into the guest
+o-linux image IMAGE.raw [--read-write|--read-only]
+                               Image bridge using the configured access mode
 o-linux disk DEVICE --expected-size BYTES
-                               Explicit read-only physical-disk bridge
+                               Physical-disk bridge; same access-mode flags
 o-linux status | start | stop | doctor
 
 The linux shortcut uses the same interface. Direct commands remain available:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expose a selected raw image or explicitly identified external disk read-only.
+"""Expose a selected raw image or explicitly identified external disk over NBD.
 
 The NBD server binds host loopback only. A dedicated SSH key permits only a
 loopback reverse tunnel; Multipass performs guest administration. Physical disks
@@ -10,6 +10,7 @@ Ctrl-C disconnects the mapping and tunnel. No filesystem is mounted here.
 import argparse
 import array
 import base64
+import contextlib
 import fcntl
 import hashlib
 import ipaddress
@@ -19,6 +20,7 @@ from pathlib import Path
 import plistlib
 import re
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -35,12 +37,23 @@ QEMU_NBD = None
 GUEST_USER = None
 HOST_PORT = 10829
 GUEST_PORT = 10819
-EXPORT = "o-linux-readonly"
+EXPORT = "o-linux"
 KEY = KNOWN = STATE = None
 IDENTITY_FIELDS = ("DeviceIdentifier", "DeviceNode", "WholeDisk", "Internal",
                    "VirtualOrPhysical", "TotalSize", "DeviceBlockSize",
                    "BusProtocol", "MediaName", "IORegistryEntryName",
                    "DeviceTreePath", "MediaUUID", "DiskUUID", "SerialNumber")
+
+
+def access_mode(record):
+    mode = record.get("access_mode", "ro")
+    if mode not in ("ro", "rw"):
+        raise RuntimeError("Storage access_mode must be ro or rw")
+    return mode
+
+
+def open_flags(mode):
+    return os.O_RDONLY if access_mode({"access_mode": mode}) == "ro" else os.O_RDWR
 
 
 def configure(settings):
@@ -112,6 +125,24 @@ def inspect_device(device, expected_size):
             raise RuntimeError(f"{name} is mounted; no automatic unmount is performed")
         if any(s in str(child.get("Content", "")) for s in ("Apple_APFS", "Apple_CoreStorage", "Apple_RAID")):
             raise RuntimeError("Compound source storage is not supported by this physical bridge")
+    # anylinuxfs mounts are NFS presentations and diskutil's partition MountPoint
+    # can be empty while its microVM has the same raw partition open.
+    host_mounts = run(["/sbin/mount"]).stdout
+    for name in names:
+        if re.search(r"(?:^|\n)" + re.escape(name) + r"\.local:", host_mounts):
+            raise RuntimeError(f"{name} has an active anylinuxfs NFS mount; refusing a second raw export")
+    anylinuxfs = shutil.which("anylinuxfs")
+    if anylinuxfs:
+        status = run([anylinuxfs, "status"])
+        if status.stderr.strip():
+            raise RuntimeError("Cannot establish anylinuxfs mount ownership: " + status.stderr.strip())
+        for line in status.stdout.splitlines():
+            if " on " not in line:
+                raise RuntimeError("Unrecognized anylinuxfs mount status; refusing a raw export")
+            source = line.split(" on ", 1)[0]
+            devices = set(re.findall(r"(?<![A-Za-z0-9_])(disk[0-9]+(?:s[0-9]+)*)(?![A-Za-z0-9_])", source))
+            if devices.intersection(names):
+                raise RuntimeError("Selected disk has an active anylinuxfs instance; refusing a second raw export")
     st = os.lstat(device)
     if not stat.S_ISBLK(st.st_mode):
         raise RuntimeError("Expected a block-device node, not a symlink, regular file, or character device")
@@ -124,7 +155,8 @@ def inspect_device(device, expected_size):
 
 DEVICE_OPENER = r"""
 import array,json,os,plistlib,socket,stat,subprocess,sys
-device,sockpath,serialized=sys.argv[1:]
+device,sockpath,serialized,mode=sys.argv[1:]
+if mode not in ('ro','rw'): raise RuntimeError('Invalid physical source access mode')
 expected=json.loads(serialized)
 def check():
     raw=subprocess.check_output(['/usr/sbin/diskutil','info','-plist',device],timeout=15)
@@ -136,7 +168,7 @@ def check():
     if [st.st_rdev,st.st_ino,st.st_ctime_ns]!=expected['device_stat']:
         raise RuntimeError('Device node was replaced')
 check()
-fd=os.open(device,os.O_RDONLY|os.O_NOFOLLOW)
+fd=os.open(device,(os.O_RDONLY if mode=='ro' else os.O_RDWR)|os.O_NOFOLLOW)
 try:
     st=os.fstat(fd)
     if not stat.S_ISBLK(st.st_mode) or [st.st_rdev,st.st_ino,st.st_ctime_ns]!=expected['device_stat']:
@@ -149,9 +181,10 @@ finally: os.close(fd)
 """
 
 
-def open_physical(device, expected_size, before):
+def open_physical(device, expected_size, before, mode="ro"):
     """Privilege only the short open/FD-transfer helper, not QEMU or SSH."""
     received = None
+    flags = open_flags(mode)
     with tempfile.TemporaryDirectory(prefix="nbd_open_", dir=BASE) as temp:
         os.chmod(temp, 0o700)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -161,7 +194,7 @@ def open_physical(device, expected_size, before):
             listener.settimeout(0.2)
             helper = subprocess.Popen(
                 ["/usr/bin/sudo", "-n", sys.executable, "-I", "-c", DEVICE_OPENER,
-                 device, path, json.dumps(before)], stdout=subprocess.PIPE,
+                 device, path, json.dumps(before), mode], stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, start_new_session=True)
             try:
                 deadline = time.monotonic() + 35
@@ -171,7 +204,7 @@ def open_physical(device, expected_size, before):
                         break
                     except socket.timeout:
                         if helper.poll() is not None or time.monotonic() > deadline:
-                            raise RuntimeError("Privileged read-only open failed: " + helper.communicate(timeout=2)[1])
+                            raise RuntimeError("Privileged " + mode + " open failed: " + helper.communicate(timeout=2)[1])
                 with connection:
                     connection.settimeout(3)
                     message, ancillary, _, _ = connection.recvmsg(1, socket.CMSG_SPACE(array.array('i').itemsize))
@@ -187,8 +220,8 @@ def open_physical(device, expected_size, before):
                 st = os.fstat(received)
                 if (not stat.S_ISBLK(st.st_mode)
                         or [st.st_rdev, st.st_ino, st.st_ctime_ns] != before["device_stat"]
-                        or fcntl.fcntl(received, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY):
-                    raise RuntimeError("Transferred descriptor is not the selected read-only disk")
+                        or fcntl.fcntl(received, fcntl.F_GETFL) & os.O_ACCMODE != flags):
+                    raise RuntimeError("Transferred descriptor is not the selected " + mode + " disk")
                 after = inspect_device(device, expected_size)
                 if after != before: raise RuntimeError("Disk identity or partitions changed during open")
                 return received
@@ -337,6 +370,8 @@ def load():
         raise RuntimeError('Storage receipt belongs to another operation or instance')
     if receipt.get('device') and not re.fullmatch('/dev/nbd[0-9]+',receipt['device']):
         raise RuntimeError('Invalid NBD device in receipt')
+    if receipt.get('access_mode','ro') not in ('ro','rw'):
+        raise RuntimeError('Invalid NBD access mode in receipt')
     return receipt
 def current_pid(device):
     path=blocks/pathlib.Path(device).name/'pid'
@@ -347,14 +382,44 @@ def start_time(pid):
 def inactive(device):
     path=blocks/pathlib.Path(device).name
     return current_pid(device) is None and (not path.exists() or (path/'size').read_text().strip()=='0')
+def require_unmounted(device):
+    name=pathlib.Path(device).name
+    related=[blocks/name,*blocks.glob(name+'p[0-9]*')]
+    numbers=set()
+    for block in related:
+        if not block.exists(): continue
+        if any((block/'holders').iterdir()):
+            raise RuntimeError('Guest block device has active holders; release them before disconnecting')
+        number=(block/'dev').read_text().strip()
+        if not re.fullmatch('[0-9]+:[0-9]+',number): raise RuntimeError('Invalid guest device identity')
+        numbers.add(number)
+    if not numbers: raise RuntimeError('Guest device identity is unavailable for mount verification')
+    for line in (processes/'self/mountinfo').read_text().splitlines():
+        fields=line.split()
+        if len(fields)<6: raise RuntimeError('Incomplete guest mount metadata')
+        if fields[2] in numbers:
+            raise RuntimeError('Guest NBD device or partition is mounted; unmount it before disconnecting')
+    swaps=(processes/'swaps').read_text().splitlines()
+    if not swaps or not swaps[0].startswith('Filename'):
+        raise RuntimeError('Incomplete guest swap metadata')
+    for line in swaps[1:]:
+        fields=line.split()
+        if len(fields)!=5: raise RuntimeError('Incomplete guest swap entry')
+        filename=re.sub(r'\\([0-7]{3})',lambda match:chr(int(match[1],8)),fields[0])
+        info=os.stat(filename)
+        number=info.st_rdev if stat.S_ISBLK(info.st_mode) else info.st_dev
+        if str(os.major(number))+':'+str(os.minor(number)) in numbers:
+            raise RuntimeError('Guest NBD storage is active swap; disable it before disconnecting')
 def reply(receipt): print(json.dumps(receipt),flush=True)
 """
 
 CONNECT = GUEST_RECEIPTS + r"""
-port,export=sys.argv[3:]
+port,export,*modes=sys.argv[3:]
+mode=modes[0] if modes else 'ro'
+if len(modes)>1 or mode not in ('ro','rw'): raise RuntimeError('Invalid requested storage access mode')
 receipt=load()
 if receipt is not None: raise RuntimeError('Storage operation already exists; reconcile its receipt before retrying')
-receipt={'operation_id':operation,'instance':instance,'status':'pending','export':export}
+receipt={'operation_id':operation,'instance':instance,'status':'pending','export':export,'access_mode':mode}
 save(receipt)
 subprocess.run(['modprobe','nbd','nbds_max=16','max_part=16'],check=True,capture_output=True,text=True)
 subprocess.run(['udevadm','settle','--timeout=10'],check=True,timeout=12,capture_output=True,text=True)
@@ -367,7 +432,8 @@ if device is None: raise RuntimeError('No unused NBD device is available')
 receipt['device']=device
 save(receipt)
 # Netlink leaves a historical creator PID; ioctl mode keeps a live owner daemon.
-result=subprocess.run(['nbd-client','-L','-N',export,'-R','-t','10','127.0.0.1',port,device],text=True,capture_output=True,timeout=20)
+command=['nbd-client','-L','-N',export]+(['-R'] if mode=='ro' else [])+['-t','10','127.0.0.1',port,device]
+result=subprocess.run(command,text=True,capture_output=True,timeout=20)
 if result.returncode: raise RuntimeError(result.stdout+result.stderr)
 deadline=time.monotonic()+5
 while time.monotonic()<deadline:
@@ -382,18 +448,23 @@ else: raise RuntimeError('NBD attachment has no verifiable live owner daemon')
 receipt.update(status='attached',client_pid=pid,client_start=started)
 save(receipt)
 readonly=subprocess.check_output(['blockdev','--getro',device],text=True,timeout=10).strip()
-if readonly!='1': raise RuntimeError('Guest did not report a read-only block device')
-receipt['read_only']=True
+if readonly!=('1' if mode=='ro' else '0'): raise RuntimeError('Guest block device does not match requested '+mode+' mode')
+receipt['read_only']=mode=='ro'
 save(receipt)
 reply(receipt)
 """
 
 DISCONNECT = GUEST_RECEIPTS + r"""
-expected_device,expected_pid=(value if value!='-' else '' for value in sys.argv[3:])
+expected_device,expected_pid,*binding=(value if value!='-' else '' for value in sys.argv[3:])
+mode,export=binding if binding else ('ro','')
+if mode not in ('ro','rw'): raise RuntimeError('Invalid cleanup access mode')
 receipt=load()
 if receipt is None:
     # A tombstone also prevents a delayed attach from starting after cleanup.
-    receipt={'operation_id':operation,'instance':instance,'status':'cancelled'}
+    receipt={'operation_id':operation,'instance':instance,'status':'cancelled','access_mode':mode,'export':export}
+elif (receipt.get('access_mode','ro')!=mode
+      or (export and receipt.get('export')!=export and not (mode=='ro' and receipt.get('status')=='cancelled' and not receipt.get('export')))):
+    raise RuntimeError('Host and guest storage mode/export receipts disagree')
 elif receipt['status'] not in ('cancelled','detached'):
     device=receipt.get('device')
     if expected_device and (device!=expected_device or receipt.get('client_pid')!=expected_pid):
@@ -404,6 +475,12 @@ elif receipt['status'] not in ('cancelled','detached'):
             raise RuntimeError('Attachment ownership is unknown; retaining pending receipt')
         if current_pid(device)!=pid or start_time(pid)!=receipt['client_start']:
             raise RuntimeError('NBD ownership changed; refusing to disconnect another mapping')
+        if mode=='rw':
+            require_unmounted(device)
+            subprocess.run(['blockdev','--flushbufs',device],check=True,timeout=15,capture_output=True,text=True)
+            if current_pid(device)!=pid or start_time(pid)!=receipt['client_start']:
+                raise RuntimeError('NBD ownership changed during flush; refusing disconnect')
+            require_unmounted(device)
         subprocess.run(['nbd-client','-L','-d',device],check=True,timeout=15,capture_output=True,text=True)
         deadline=time.monotonic()+5
         while not inactive(device) and time.monotonic()<deadline: time.sleep(0.1)
@@ -426,28 +503,30 @@ def stop(process):
         process.wait(timeout=5)
 
 
-def open_image(path):
-    """Pin a nonempty regular file with a read-only descriptor."""
+def open_image(path, mode="ro"):
+    """Pin a nonempty regular file with the requested descriptor access."""
+    flags = open_flags(mode)
     source = Path(path).expanduser().resolve(strict=True)
     if source == Path('/dev') or Path('/dev') in source.parents:
         raise RuntimeError("Image mode rejects devices; use explicit --device and --expected-size")
     if not source.is_file():
         raise RuntimeError("Image must be a regular file")
-    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(source, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         current = os.fstat(fd)
         if not stat.S_ISREG(current.st_mode) or current.st_size == 0:
             raise RuntimeError("Image must be a nonempty regular file")
-        if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
-            raise RuntimeError("Image descriptor is not read-only")
+        if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != flags:
+            raise RuntimeError("Image descriptor does not match " + mode + " mode")
         return source, fd
     except BaseException:
         os.close(fd)
         raise
 
 
-def server_arguments(fd, export=EXPORT):
-    return [QEMU_NBD, "--read-only", "--format=raw", "--bind=127.0.0.1",
+def server_arguments(fd, export=EXPORT, mode="ro"):
+    open_flags(mode)
+    return [QEMU_NBD, *(["--read-only"] if mode == "ro" else []), "--format=raw", "--bind=127.0.0.1",
             f"--port={HOST_PORT}", f"--export-name={export}", "--persistent",
             "--shared=1", f"/dev/fd/{fd}"]
 
@@ -477,33 +556,41 @@ def receipt_response(output, state, *, clean=False):
             or receipt.get("operation_id") != state["operation_id"]
             or receipt.get("instance") != state["instance"]):
         raise RuntimeError("Guest receipt does not identify this storage operation")
+    mode = access_mode(state)
+    if access_mode(receipt) != mode:
+        raise RuntimeError("Guest receipt access mode does not match this storage operation")
+    if receipt.get("export") != state.get("export") and not (
+            clean and mode == "ro" and receipt.get("status") == "cancelled" and not receipt.get("export")):
+        raise RuntimeError("Guest receipt export does not match this storage operation")
     if clean:
         if receipt.get("clean") is not True or receipt.get("status") not in ("detached", "cancelled"):
             raise RuntimeError("Guest did not confirm storage cleanup")
-    elif (receipt.get("status") != "attached" or receipt.get("read_only") is not True
+    elif (receipt.get("status") != "attached" or receipt.get("read_only") is not (mode == "ro")
           or not re.fullmatch(r"/dev/nbd[0-9]+", str(receipt.get("device", "")))
           or not re.fullmatch(r"[1-9][0-9]*", str(receipt.get("client_pid", "")))
           or not re.fullmatch(r"[0-9]+", str(receipt.get("client_start", "")))
           or receipt.get("export") != state["export"]):
-        raise RuntimeError("Guest did not confirm an owned read-only attachment")
+        raise RuntimeError("Guest did not confirm an owned " + mode + " attachment")
     return receipt
 
 
 def attach(instance, state):
     """Write intent before execution so lost client output cannot lose ownership."""
+    mode = access_mode(state)
     save_state(state)
     connected = guest(instance, ["sudo", "-n", "python3", "-c", CONNECT,
                                 instance, state["operation_id"], str(GUEST_PORT),
-                                state["export"]], timeout=45)
+                                state["export"], mode], timeout=45)
     state.update(receipt_response(connected.stdout, state))
     save_state(state)
     return state
 
 
 def disconnect_operation(instance, state):
+    mode = access_mode(state)
     result = guest(instance, ["sudo", "-n", "python3", "-c", DISCONNECT,
                              instance, state["operation_id"], state.get("device") or "-",
-                             state.get("client_pid") or "-"], timeout=45)
+                             state.get("client_pid") or "-", mode, state.get("export") or "-"], timeout=45)
     return receipt_response(result.stdout, state, clean=True)
 
 
@@ -516,6 +603,13 @@ def cleanup(instance, state, tunnel, server, fd):
         except Exception as error:
             clean = False
             print(f"Guest cleanup could not be verified: {error}", file=sys.stderr)
+    if not clean and access_mode(state) == "rw":
+        if fd is not None:
+            os.close(fd)
+        print(f"Retaining the read-write NBD server, SSH tunnel and operation receipt: {STATE}\n"
+              "Unmount guest filesystems or release block holders, then run linux image --cleanup-pending. "
+              "The retained host process identities require verification before they are stopped.", file=sys.stderr)
+        return False
     try:
         stop(tunnel)
     finally:
@@ -574,9 +668,14 @@ def main(argv=None):
     parser.add_argument("--instance", help="Override the configured Linux instance")
     parser.add_argument("--cleanup-pending", action="store_true",
                         help="Reconcile a retained operation using its guest receipt; never reopen its source")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--read-only", dest="access_mode", action="store_const", const="ro",
+                       help="Export with a read-only source descriptor, server and guest device")
+    modes.add_argument("--read-write", dest="access_mode", action="store_const", const="rw",
+                       help="Allow guest writes to the selected source; overrides storage_access_mode")
     args = parser.parse_args(argv)
-    if args.cleanup_pending and (args.image or args.device or args.expected_size is not None):
-        parser.error("--cleanup-pending cannot be combined with a source")
+    if args.cleanup_pending and (args.image or args.device or args.expected_size is not None or args.access_mode is not None):
+        parser.error("--cleanup-pending uses the recorded source and mode; it cannot be combined with either override")
     if not args.cleanup_pending and bool(args.image) == bool(args.device):
         parser.error("Choose exactly one regular image or --device")
     if args.device and args.expected_size is None:
@@ -584,6 +683,7 @@ def main(argv=None):
     if args.image and args.expected_size is not None:
         parser.error("--expected-size is only valid with --device")
     settings = load_config()
+    mode = access_mode({"access_mode": args.access_mode or settings.get("storage_access_mode", "ro")})
     configure(settings)
     physical = None
     BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -591,6 +691,7 @@ def main(argv=None):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        lock.close()
         parser.error("Another image bridge is already running")
     if args.cleanup_pending:
         try:
@@ -598,23 +699,31 @@ def main(argv=None):
         finally:
             lock.close()
         return
-    args.instance = args.instance or settings["instance"]
-    if STATE.exists():
-        parser.error(f"An earlier mapping needs cleanup; run linux image --cleanup-pending or inspect {STATE}")
-    if args.device:
-        physical = inspect_device(args.device, args.expected_size)
-        source = Path(args.device)
-        print("Selected external disk: " + json.dumps(physical, sort_keys=True), flush=True)
-    else:
-        source = Path(args.image).expanduser()
-    if physical:
-        fd = open_physical(args.device, args.expected_size, physical)
-    else:
-        source, fd = open_image(source)
+    leases = contextlib.ExitStack()
+    try:
+        args.instance = args.instance or settings["instance"]
+        if STATE.exists():
+            parser.error(f"An earlier mapping needs cleanup; run linux image --cleanup-pending or inspect {STATE}")
+        if args.device:
+            from .drives import drive_lock
+            leases.enter_context(drive_lock())
+            physical = inspect_device(args.device, args.expected_size)
+            source = Path(args.device)
+            print("Selected external disk: " + json.dumps(physical, sort_keys=True), flush=True)
+        else:
+            source = Path(args.image).expanduser()
+        if physical:
+            fd = open_physical(args.device, args.expected_size, physical, mode)
+        else:
+            source, fd = open_image(source, mode)
+    except BaseException:
+        leases.close()
+        lock.close()
+        raise
     server = tunnel = None
     state = None
     operation = uuid.uuid4().hex
-    export = EXPORT + "-" + operation
+    export = EXPORT + "-" + mode + "-" + operation
     stopping = False
     def request_stop(*_):
         nonlocal stopping
@@ -629,9 +738,11 @@ def main(argv=None):
             probe.bind(("127.0.0.1", HOST_PORT))
         server_log = (BASE / "nbd_server.log").open("w")
         tunnel_log = (BASE / "nbd_tunnel.log").open("w")
-        # Inherited read-only FD pins the selected file against path replacement.
+        if physical and inspect_device(args.device, args.expected_size) != physical:
+            raise RuntimeError("Physical disk identity or mount state changed before export")
+        # The inherited FD pins the selected source and its requested access.
         server = subprocess.Popen(
-            server_arguments(fd, export), pass_fds=(fd,),
+            server_arguments(fd, export, mode), pass_fds=(fd,),
             stdout=server_log, stderr=server_log, start_new_session=True)
         for _ in range(40):
             if server.poll() is not None:
@@ -657,17 +768,17 @@ def main(argv=None):
             raise RuntimeError("SSH tunnel exited; see nbd_tunnel.log")
         if stopping:
             raise KeyboardInterrupt()
-        state = dict(operation_id=operation, status="pending", export=export,
+        state = dict(operation_id=operation, status="pending", export=export, access_mode=mode,
                      source=str(source), source_mode="physical" if physical else "image",
                      source_identity=physical, instance=args.instance,
                      host_pid=os.getpid(), server_pid=server.pid, tunnel_pid=tunnel.pid,
                      host_port=HOST_PORT, guest_port=GUEST_PORT, format="raw",
                      guest_receipt=f"/run/o-linux-nbd/{operation}.json")
         mapping = attach(args.instance, state)
-        print(f"Read-only {'physical disk' if physical else 'RAW image'}: {source}", flush=True)
-        print(f"Linux {args.instance}: {mapping['device']} (read_only=1)", flush=True)
+        print(f"{'Read-only' if mode == 'ro' else 'Read-write'} {'physical disk' if physical else 'RAW image'}: {source}", flush=True)
+        print(f"Linux {args.instance}: {mapping['device']} (access_mode={mode}, read_only={int(mode == 'ro')})", flush=True)
         print("No filesystem mounted. Ctrl-C disconnects this mapping and tunnel.", flush=True)
-        if physical:
+        if physical and mode == "ro":
             print("This export blocks guest writes; independent macOS writes are not globally blocked.", flush=True)
         next_identity_check = time.monotonic() + 5
         while not stopping and server.poll() is None and tunnel.poll() is None:
@@ -680,13 +791,14 @@ def main(argv=None):
             raise KeyboardInterrupt()
         raise RuntimeError("NBD server or SSH tunnel exited unexpectedly")
     except KeyboardInterrupt:
-        print("\nDisconnecting read-only storage bridge...", flush=True)
+        print("\nDisconnecting " + mode + " storage bridge...", flush=True)
     finally:
         try:
             cleaned = cleanup(args.instance, state, tunnel, server, fd)
         finally:
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGINT, old_int)
+            leases.close()
             lock.close()
         if not cleaned:
             raise RuntimeError(f"Storage disconnect is incomplete; inspect {STATE}")

@@ -20,7 +20,7 @@ I also connect this interface to [OSTADIX](https://github.com/lostadi/OSTADIX): 
 | Files | Host home at the same absolute path; `/Volumes` by default | Existing filesystem |
 | Host commands | `mac COMMAND` from the guest, over a pinned SSH connection | Commands execute locally |
 | Peripheral inventory | Native macOS metadata tools | Native Linux metadata tools, where installed |
-| Raw image or external disk bridge | Explicit read-only NBD export to the guest | Use the host's native block-device access |
+| Raw image or external disk bridge | NBD export with a selected read/write mode | Use the host's native block-device access |
 | OSTADIX jobs and system tools | Installed host OSTADIX checkout | Installed local OSTADIX checkout |
 
 **Install on macOS.** The host needs Python 3.10 or newer, Multipass, QEMU's `qemu-nbd`, and OpenSSH. Install the prerequisites through your package manager; with Homebrew:
@@ -42,11 +42,14 @@ The default guest is named `o-linux`, uses Ubuntu 26.04, and has 4 CPUs, 4 GB of
 ./setup.sh --cpus 6 --memory 8G --disk 32G
 ./setup.sh --instance my-existing-linux --adopt-existing
 ./setup.sh --replace-launcher
+./setup.sh --map-root
 ```
 
 `--adopt-existing` explicitly selects an existing Multipass VM for configuration. Setup preserves its disk and checks for the required guest tools (`python3`, `nbd-client`, and `ddrescue`). It may start the guest, provision the command bridges, and add missing shared-directory mappings. An unrelated `linux` or `o-linux` launcher is preserved unless `--replace-launcher` is supplied; replacement creates a backup.
 
 The host home and `/Volumes` are shared with the guest. These are working shares, so guest file changes affect the host. `--no-volumes` avoids adding a `/Volumes` mapping; it preserves any mapping already present. `--volumes` enables that mapping. On repeat setup, omitted resource and sharing flags retain the saved configuration.
+
+`--map-root` adds persistent root-to-root UID/GID mappings within these two shares, alongside the normal account mappings. This permits access to root-owned entries that Multipass otherwise rejects even when their Unix permissions allow access. Setup preserves custom mappings, normally unmounts and recreates only the managed shares that need an update, and retains the full mapping plan if an update is interrupted. It does not share the host's root filesystem.
 
 **Install on Linux.** Use the same checkout and setup command with Python 3.10 or newer:
 
@@ -86,10 +89,10 @@ Inventory does not open cameras, record audio, print documents, open serial port
 
 The Mac bridge runs with ordinary account permissions. macOS privacy permissions, including TCC, still apply. There is no general USB, GPU, camera, Bluetooth, or other peripheral passthrough. Devices remain usable through native host tools where those tools and permissions permit it; block storage has the explicit bridge below.
 
-**Remember a Linux drive and open it read-only.** On macOS, the drive command uses anylinuxfs to mount a selected Linux partition read-only. Select the partition once from a current disk inventory; the saved identity is its partition UUID, so later opens locate the same partition even if macOS assigns a different disk number:
+**Remember a Linux drive and its access mode.** On macOS, the drive command uses anylinuxfs to mount a selected Linux partition. New selections default to read-write; `--read-only` selects recovery-style access. Select the partition once from a current disk inventory; the saved identity is its partition UUID, so later opens locate the same partition even if macOS assigns a different disk number:
 
 ```text
-o-linux drive select /dev/diskNsN --filesystem ext4
+o-linux drive select /dev/diskNsN --filesystem ext4 --read-write
 o-linux drive
 o-linux drive status
 o-linux drive close
@@ -103,20 +106,31 @@ brew trust nohajc/anylinuxfs
 brew install anylinuxfs
 ```
 
-Selection records metadata in the private `drives.json` file and does not mount the partition or require sudo. `--mountpoint /Volumes/Your-ReadOnly-Drive` chooses the saved mount location; otherwise the default is `/Volumes/Linux-Drive-ReadOnly`. Open, verification of an active mount, and close need macOS authorization. An interactive command requests it in the same Mac session when needed; a captured command fails clearly if authorization is unavailable.
+Selection records metadata in the private `drives.json` file and does not mount the partition or require sudo. `--mountpoint /Volumes/Your-Drive` chooses the saved mount location; otherwise the default is `/Volumes/Linux-Drive`. Open, verification of an active mount, and close need macOS authorization. An interactive command requests it in the same Mac session when needed; a captured command fails clearly if authorization is unavailable.
+
+Existing profiles retain their prior read-only mode. To change a saved drive, close its current mount, save the mode, then open it:
+
+```sh
+o-linux drive close
+o-linux drive mode rw --mountpoint /Volumes/Linux-Drive
+o-linux drive
+```
+
+Use `mode ro` to select read-only access. A mode change preserves the saved drive identity and requires its mount and pending operations to be cleared. An exact owned inactive reader can be closed after disconnection, and the new mode can then be saved for the next connection. Status distinguishes a disconnected selection from a mounted drive.
 
 The same `o-linux drive` commands work inside the provisioned Ubuntu guest. They use the pinned Mac bridge and the Mac's saved selection. A host-only dispatch guard rejects a wrongly configured non-Mac destination. Standalone Linux installations without this bridge cannot use the anylinuxfs reader.
 
-`lsblk` in Ubuntu lists the guest's block devices. A drive opened by this filesystem workflow remains mounted on the Mac and does not become a guest block device. If the shared `/Volumes` path is inaccessible, use the host command bridge to read it:
+`lsblk` in Ubuntu lists the guest's block devices. A drive opened by this filesystem workflow remains mounted on the Mac and does not become a guest block device. Use the shared `/Volumes` path for normal file access after configuring its ID mappings, or use the host command bridge:
 
 ```sh
-mac ls /Volumes/Linux-Drive-ReadOnly
-mac cat /Volumes/Linux-Drive-ReadOnly/path/to/file > recovered-file
+ls /Volumes/Linux-Drive
+mac ls /Volumes/Linux-Drive
+mac cat /Volumes/Linux-Drive/path/to/file > recovered-file
 ```
 
 The second command writes a copy into the guest's current directory. Host permissions still apply to the source.
 
-`o-linux drive` and `o-linux drive open` evaluate the installed `.O` document to obtain a typed, fixed read-only request bound to the saved selection's digest. The native host adapter validates the returned request against the current saved selection before performing the privileged operation. Selection and status use the metadata interface; close explicitly closes the saved selection. Opening an ext4 selection requires both `ro,noload` on the Linux filesystem and a read-only NFS presentation to macOS. An already-active matching mount is reused only after those read-only properties and the physical filesystem identity are verified.
+`o-linux drive` and `o-linux drive open` evaluate the installed `.O` document to obtain a typed request bound to the saved selection, access mode and invocation nonce. The native host adapter validates that request before performing the fixed open operation. Read-write mode requires a writable block device, ext4 `rw` with journal handling enabled, a writable NFS export and a writable host mount. Read-only mode requires a read-only block device, ext4 `ro,noload` and read-only NFS layers. An already-active matching mount is reused only after its mode and physical filesystem identity are verified.
 
 After a disconnect, macOS may assign the same partition a new disk number while its old mount remains. Status reports an identified stale mount without changing it. Open can retire that mount and reopen the selected partition only when the old devices are absent or positively identified as inactive, the exact saved mount receipt still matches, and the current physical filesystem has the saved UUID. Retained device nodes must match inactive IOMedia records for the saved partition and whole-disk sizes and be absent from the active disk inventory. Teardown intent is saved before normal unmount; uncertain completion is retained and never triggers repeated teardown. Conflicting or unowned mounts are left untouched.
 
@@ -128,25 +142,25 @@ O "$HOME/.local/share/o-linux/app/integrations/ostadix/read-drive.O" /absolute/p
 
 The document calls `drive_frontend.open_request()` through the Python backend and returns a structured O value. It performs no mount or sudo operation. `o-linux drive` provides the native adapter that carries out the validated request. This boundary is necessary on macOS: the sandboxed backend cannot execute sudo even with O's ordinary process authority. The workflow does not disable the sandbox or route privilege through an SSH workaround.
 
-`O_LINUX_STATE` selects the installation containing the module and saved drive identity; it does not select a different action. The request binds the selected profile's digest, and the host adapter checks it again before dispatch. A source digest alone would not bind the environment or saved configuration. This request-and-adapter workflow is separate from the checked, planned, receipt-producing `o-linux job` workflow below. The resulting mount opens a filesystem for reading; it does not repair the filesystem or recover damaged media.
+`O_LINUX_STATE` selects the installation containing the module and saved drive identity. The request binds the selected profile's digest and mode, and the host adapter checks them again before dispatch. A source digest alone would not bind the environment or saved configuration. This request-and-adapter workflow is separate from the checked, planned, receipt-producing `o-linux job` workflow below. Read-write mode permits normal filesystem changes and journal replay; mounting does not run a filesystem repair or recover damaged media.
 
 The adapter records its own declaration and native-operation receipt under `runs/drive-*` in the private state directory. A fresh nonce binds the returned request to that invocation. The saved-profile lock covers declaration, validation, and native dispatch. Failure after native dispatch is recorded as unknown completion rather than a rejected declaration; an uncertain mount is retained for reconciliation instead of automatically launched again.
 
 For an existing raw disk image on macOS:
 
 ```sh
-o-linux image /path/to/image.raw
+o-linux image /path/to/image.raw --read-write
 ```
 
 For a physical disk, first inspect a current inventory and obtain its exact byte size. Then substitute that exact whole-disk path and size:
 
 ```text
-o-linux disk /dev/diskN --expected-size EXACT_BYTE_COUNT
+o-linux disk /dev/diskN --expected-size EXACT_BYTE_COUNT --read-write
 ```
 
-The physical bridge accepts an external, physical, whole disk with no mounted partitions and rejects unsupported compound layouts. Run `sudo -v` first to establish authorization if the device requires privileged access; the device opener uses noninteractive `sudo -n` and fails if authorization is unavailable. The source is opened read-only, `qemu-nbd` exports it read-only, and the guest attachment must report read-only before setup succeeds. The command prints the allocated guest device and stays in the foreground. It mounts no filesystem; Ctrl-C disconnects its mapping and tunnel.
+The physical bridge accepts an external, physical, whole disk with no mounted partitions and rejects unsupported compound layouts and active anylinuxfs readers. Run `sudo -v` first if the device requires privileged access. `--read-write` and `--read-only` select the source descriptor, NBD server and guest block-device mode together. Without a flag, the private `storage_access_mode` configuration selects the mode; existing configurations default to `ro`. The command prints the allocated guest device and stays in the foreground. It mounts no filesystem. Unmount any guest filesystem before closing a writable bridge; its cleanup flushes the owned device before disconnecting.
 
-This blocks writes through that export. It does not globally block independent macOS writers, establish a drive's health, recover files, or make a failing drive safe to keep reading. A read-only export still reads the source. Disk recovery and filesystem operations remain separate, explicit work.
+Read-write exports allow guest writes to the selected source. Read-only exports block writes through that export. Neither mode globally excludes independent host processes or establishes a drive's health. Disk recovery and filesystem operations remain separate work.
 
 If a connection or cleanup operation has an unknown result, the bridge retains its ownership record. `o-linux image --cleanup-pending` reconciles that record against the guest receipt without reopening the source. It does not guess ownership or discard an unresolved mapping to make room for another one.
 

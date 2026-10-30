@@ -1,4 +1,4 @@
-"""Save one external ext4 partition and open it through a verified read-only mount."""
+"""Save one external ext4 partition and open it with a verified access mode."""
 
 import argparse
 import contextlib
@@ -18,9 +18,24 @@ import uuid
 
 from .config import command, load_config, run, state_dir
 
-DEFAULT_MOUNT = "/Volumes/Linux-Drive-ReadOnly"
+DEFAULT_MOUNT = "/Volumes/Linux-Drive"
 AUDITED_ANYLINUXFS_VERSION = "0.20.1"
 PARTITION = re.compile(r"/dev/disk[0-9]+s[0-9]+")
+
+
+def access_mode(selection):
+    """Old profiles remain read-only until their mode is explicitly changed."""
+    mode = selection.get("access_mode", "ro")
+    if mode not in ("ro", "rw"):
+        raise RuntimeError("Saved drive access_mode must be ro or rw")
+    return mode
+
+
+def receipt_mode(receipt):
+    mode = access_mode(receipt)
+    if receipt.get("read_only") is not (mode == "ro"):
+        raise RuntimeError("Mount receipt access mode is inconsistent")
+    return mode
 
 
 def canonical_uuid(value, label="UUID"):
@@ -58,7 +73,7 @@ def inventory():
     return sorted("/dev/" + name for name in names if re.fullmatch(r"disk[0-9]+s[0-9]+", name))
 
 
-def selection_for(device, mountpoint=DEFAULT_MOUNT):
+def selection_for(device, mountpoint=DEFAULT_MOUNT, mode="rw"):
     """Use diskutil metadata only; selection neither probes nor mounts a source."""
     if not PARTITION.fullmatch(device):
         raise RuntimeError("Select an exact partition path such as /dev/disk4s3")
@@ -81,7 +96,7 @@ def selection_for(device, mountpoint=DEFAULT_MOUNT):
             "filesystem_uuid": canonical_uuid(fs_uuid, "filesystem UUID") if fs_uuid else None,
             "filesystem": "ext4", "partition_bytes": partition_bytes, "whole_bytes": whole_bytes,
             "media_name": whole["MediaName"], "bus_protocol": whole.get("BusProtocol"),
-            "mountpoint": mount_path(mountpoint)}
+            "mountpoint": mount_path(mountpoint), "access_mode": access_mode({"access_mode": mode})}
 
 
 def locate(selection):
@@ -129,6 +144,7 @@ def load_record():
             raise RuntimeError("Invalid saved drive size")
     if not selection.get("media_name"):
         raise RuntimeError("Missing saved media identity")
+    access_mode(selection)
     return record
 
 
@@ -323,17 +339,24 @@ def selected_mount(entries, device, mountpoint):
     return matches[0] if matches else None
 
 
-def status_entry(status, device, mountpoint):
+def check_mount_options(options, mode):
+    if mode == "ro":
+        valid = {"ext4", "ro", "noload"} <= options and "rw" not in options
+    else:
+        valid = {"ext4", "rw"} <= options and not options.intersection({"ro", "noload", "norecovery"})
+    if not valid:
+        raise RuntimeError("anylinuxfs did not confirm ext4 " + ("ro,noload" if mode == "ro" else "rw with journal replay enabled"))
+
+
+def status_entry(status, device, mountpoint, mode="ro"):
     entry = selected_mount(parse_status(status), device, mountpoint)
     if not entry:
         raise RuntimeError("Expected saved drive mount was not found in anylinuxfs status")
-    options = entry["options"]
-    if not {"ext4", "ro", "noload"} <= options or "rw" in options:
-        raise RuntimeError("anylinuxfs did not confirm ext4 ro,noload")
+    check_mount_options(entry["options"], mode)
     return entry["line"]
 
 
-def host_mount(mountpoint):
+def host_mount(mountpoint, mode="ro"):
     found = []
     suffix = " on " + mountpoint
     for line in run(["/sbin/mount"]).stdout.splitlines():
@@ -344,19 +367,21 @@ def host_mount(mountpoint):
     if len(found) != 1:
         raise RuntimeError("Expected host mount was not uniquely verified")
     source, options = found[0]
-    if not {"nfs", "read-only"} <= options or "rw" in options:
-        raise RuntimeError("Host NFS read-only flag was not verified")
+    if ("nfs" not in options or (mode == "ro" and ("read-only" not in options or "rw" in options))
+            or (mode == "rw" and options.intersection({"read-only", "ro"}))):
+        raise RuntimeError("Host NFS " + mode + " mode was not verified")
     return source
 
 
 def verify_mount(app, selection, device, status_text=None):
-    """Verify each read-only layer without listing files or testing source writes."""
+    """Verify each access-mode layer without listing files or testing writes."""
     mountpoint = selection["mountpoint"]
+    mode = access_mode(selection)
     status = any_status(app) if status_text is None else status_text
-    status_line = status_entry(status, device, mountpoint)
+    status_line = status_entry(status, device, mountpoint, mode)
     if Path(mountpoint).is_symlink() or not os.path.ismount(mountpoint):
         raise RuntimeError("Expected a real host mount, not a symlink or directory")
-    host_source = host_mount(mountpoint)
+    host_source = host_mount(mountpoint, mode)
     guest_path = "/mnt/" + Path(mountpoint).name
     if host_source != Path(device).name + ".local:" + guest_path:
         raise RuntimeError("Host NFS source does not match the selected drive")
@@ -368,12 +393,14 @@ def verify_mount(app, selection, device, status_text=None):
         raise RuntimeError("Guest source mount was not uniquely verified")
     source, _, filesystem, options, _, _ = rows[0]
     options = set(options.split(","))
-    if (filesystem != "ext4" or "ro" not in options or "rw" in options
-            or not options.intersection({"noload", "norecovery"})
+    if (filesystem != "ext4" or mode not in options or ("rw" if mode == "ro" else "ro") in options
+            or (mode == "ro" and not options.intersection({"noload", "norecovery"}))
+            or (mode == "rw" and options.intersection({"noload", "norecovery"}))
             or not re.fullmatch(r"/dev/vd[a-z]+", source)):
-        raise RuntimeError("Guest ext4 read-only/no-journal-replay flags were not verified")
-    if guest_text(app, mountpoint, ["cat", "/sys/class/block/" + Path(source).name + "/ro"]) != "1":
-        raise RuntimeError("Guest block device is not read-only")
+        raise RuntimeError("Guest ext4 " + mode + " mount flags were not verified")
+    block_read_only = guest_text(app, mountpoint, ["cat", "/sys/class/block/" + Path(source).name + "/ro"])
+    if block_read_only != ("1" if mode == "ro" else "0"):
+        raise RuntimeError("Guest block device does not match " + mode + " mode")
     exports = guest_text(app, mountpoint, ["cat", "/etc/exports"])
     matching = []
     for line in exports.splitlines():
@@ -385,15 +412,16 @@ def verify_mount(app, selection, device, status_text=None):
     for client in matching[0]:
         match = re.fullmatch(r"[^()]+\(([^()]*)\)", client)
         flags = set(match[1].split(",")) if match else set()
-        if "ro" not in flags or "rw" in flags:
-            raise RuntimeError("Guest NFS export is not read-only")
+        if mode not in flags or ("rw" if mode == "ro" else "ro") in flags:
+            raise RuntimeError("Guest NFS export does not match " + mode + " mode")
     probe = guest_text(app, mountpoint, ["blkid", "-p", "-o", "export", source])
     values = dict(line.split("=", 1) for line in probe.splitlines() if "=" in line)
     filesystem_uuid = canonical_uuid(values.get("UUID"), "guest filesystem UUID")
     if (values.get("TYPE") != "ext4" or filesystem_uuid != source_uuid
             or (selection.get("filesystem_uuid") and filesystem_uuid != selection["filesystem_uuid"])):
         raise RuntimeError("Guest filesystem identity does not match the saved drive")
-    return {"mounted": True, "read_only": True, "device": device, "mountpoint": mountpoint,
+    return {"mounted": True, "read_only": mode == "ro", "access_mode": mode,
+            "device": device, "mountpoint": mountpoint,
             "partition_uuid": selection["partition_uuid"], "filesystem": "ext4",
             "filesystem_uuid": filesystem_uuid, "host_source": host_source,
             "guest_source": source, "host_mount_id": mount_id(mountpoint),
@@ -505,14 +533,17 @@ def previous_device_detached(device, selection):
     return "inactive"
 
 
-def stale_receipt(record, device):
+def stale_receipt(record, device=None):
     selection = record["selection"]
     owned = record.get("mount")
     if not isinstance(owned, dict):
         raise RuntimeError("No ownership receipt for this stale mount; leaving it unchanged")
+    mode = access_mode(selection)
+    if receipt_mode(owned) != mode:
+        raise RuntimeError("Stale mount receipt does not match the selected access mode")
     previous = owned.get("device")
     if (not isinstance(previous, str) or not PARTITION.fullmatch(previous) or previous == device
-            or owned.get("mounted") is not True or owned.get("read_only") is not True
+            or owned.get("mounted") is not True
             or owned.get("filesystem") != "ext4"
             or not selection.get("filesystem_uuid")
             or any(owned.get(key) != selection.get(key)
@@ -533,26 +564,28 @@ def owned_stale_mount(record, device, entries):
     if not mismatched:
         return None
     owned = stale_receipt(record, device)
+    mode = access_mode(record["selection"])
     previous = owned["device"]
     entry = selected_mount(entries, previous, mountpoint)
-    if (not entry or not {"ext4", "ro", "noload"} <= entry["options"]
-            or "rw" in entry["options"]):
-        raise RuntimeError("Stale anylinuxfs mount did not confirm the owned ext4 ro,noload instance")
+    if not entry:
+        raise RuntimeError("Stale anylinuxfs mount did not confirm the owned instance")
+    check_mount_options(entry["options"], mode)
     if any(item["device"] in (device, Path(device).name) for item in entries):
         raise RuntimeError("Current drive is already mounted by another anylinuxfs instance")
     old_device_state = previous_device_detached(previous, record["selection"])
     if Path(mountpoint).is_symlink() or not os.path.ismount(mountpoint):
         raise RuntimeError("Stale host mount is not the owned real mount")
-    if host_mount(mountpoint) != owned["host_source"] or mount_id(mountpoint) != owned["host_mount_id"]:
+    if host_mount(mountpoint, mode) != owned["host_source"] or mount_id(mountpoint) != owned["host_mount_id"]:
         raise RuntimeError("Stale host mount no longer matches its exact ownership receipt")
     return {"selected": True, "connected": True, "mounted": True, "stale": True, "usable": False,
             "device": device, "current_device": device, "previous_device": previous,
             "old_device_state": old_device_state,
+            "access_mode": mode, "read_only": mode == "ro",
             "mountpoint": mountpoint, "partition_uuid": owned["partition_uuid"],
             "filesystem_uuid": owned["filesystem_uuid"], "host_source": owned["host_source"],
             "host_mount_id": owned["host_mount_id"],
             "reconciliation_pending": bool(record.get("stale_unmount_attempt")),
-            "reopen_hint": "Run o-linux drive open to reconcile the saved read-only mount"}
+            "reopen_hint": "Run o-linux drive open to reconcile the saved mount"}
 
 
 def stale_mount_gone(owned, entries):
@@ -568,6 +601,66 @@ def finish_stale_unmount(record):
     save_record(record)
 
 
+def close_disconnected(app, record):
+    """Release the exact owned inactive reader without opening a source device."""
+    owned = stale_receipt(record)
+    selection = record["selection"]
+    mode = access_mode(selection)
+    if record.get("mount_attempt"):
+        raise RuntimeError("Prior mount completion is unknown; retaining its receipt")
+    def inspect():
+        status = any_status(app)
+        previous_device_detached(owned["device"], selection)
+        status_entry(status, owned["device"], owned["mountpoint"], mode)
+        point = owned["mountpoint"]
+        if (Path(point).is_symlink() or not os.path.ismount(point)
+                or host_mount(point, mode) != owned["host_source"]
+                or mount_id(point) != owned["host_mount_id"]):
+            raise RuntimeError("Disconnected mount no longer matches its ownership receipt")
+    pending = record.get("stale_unmount_attempt")
+    if pending:
+        if (not isinstance(pending, dict)
+                or any(pending.get(key) != owned.get(key) for key in OWNED_MOUNT_KEYS)
+                or access_mode(pending) != mode):
+            raise RuntimeError("Disconnected unmount intent does not match its ownership receipt")
+        if not stale_mount_gone(owned, parse_status(any_status(app))):
+            raise RuntimeError("Prior unmount completion is unknown; no teardown repeated")
+    else:
+        require_sudo()
+        inspect()
+        record["stale_unmount_attempt"] = {**{key: owned[key] for key in OWNED_MOUNT_KEYS},
+                                          "access_mode": mode, "operation_id": uuid.uuid4().hex,
+                                          "action": "close-disconnected"}
+        save_record(record)
+        inspect()
+        try:
+            run(["/usr/bin/sudo", "-n", app, "unmount", owned["mountpoint"], "--wait-for-vm=20"], timeout=40)
+            if not stale_mount_gone(owned, parse_status(any_status(app))):
+                raise RuntimeError("Owned disconnected mount is still present")
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            raise RuntimeError("Disconnected unmount completion is unknown; receipt and intent retained: " + str(error)) from error
+    finish_stale_unmount(record)
+    return {"closed": True, "connected": False, "partition_uuid": selection["partition_uuid"],
+            "mountpoint": owned["mountpoint"]}
+
+
+def require_no_physical_export():
+    """Retained raw writers must be reconciled before opening a filesystem."""
+    path = state_dir() / "storage/state.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError("Raw storage state is not a regular file; reconcile it before opening a drive")
+    if not path.exists():
+        return
+    try:
+        pending = json.loads(path.read_text())
+        if not isinstance(pending, dict) or pending.get("source_mode") not in ("physical", "image"):
+            raise ValueError("unknown source mode")
+    except (OSError, ValueError) as error:
+        raise RuntimeError("Raw storage state is unresolved; reconcile it before opening a drive") from error
+    if pending["source_mode"] == "physical":
+        raise RuntimeError("A physical-disk export is active or unresolved; close or reconcile it before opening a filesystem")
+
+
 def reconcile_stale_mount(app, record, device, entries):
     """Detach only a positively identified stale instance, then allow normal open."""
     owned = stale_receipt(record, device)
@@ -581,7 +674,8 @@ def reconcile_stale_mount(app, record, device, entries):
     pending = record.get("stale_unmount_attempt")
     if pending:
         if (not isinstance(pending, dict)
-                or any(pending.get(key) != owned.get(key) for key in OWNED_MOUNT_KEYS)):
+                or any(pending.get(key) != owned.get(key) for key in OWNED_MOUNT_KEYS)
+                or access_mode(pending) != access_mode(record["selection"])):
             raise RuntimeError("Stale unmount intent does not match its ownership receipt")
         if not stale_mount_gone(owned, parse_status(any_status(app))):
             raise RuntimeError("Prior stale unmount completion is unknown; retaining its receipt without repeating teardown")
@@ -590,6 +684,7 @@ def reconcile_stale_mount(app, record, device, entries):
     if not owned_stale_mount(record, device, parse_status(any_status(app))):
         raise RuntimeError("Stale mount changed before reconciliation; no teardown attempted")
     record["stale_unmount_attempt"] = {**{key: owned[key] for key in OWNED_MOUNT_KEYS},
+                                        "access_mode": access_mode(record["selection"]),
                                         "replacement_device": device, "operation_id": uuid.uuid4().hex}
     save_record(record)
     try:
@@ -610,21 +705,53 @@ def reconcile_stale_mount(app, record, device, entries):
 
 
 def operate(args):
+    if args.action == "open":
+        require_no_physical_export()
     if args.action == "select":
-        if ((state_dir() / "drives.json").exists()
-                and any(load_record().get(key) for key in ("mount_attempt", "stale_unmount_attempt"))):
-            raise RuntimeError("A prior mount is pending; reconcile with open/status before changing selection")
-        selection = selection_for(args.device, args.mountpoint)
+        if (state_dir() / "drives.json").exists():
+            previous = load_record()
+            if any(previous.get(key) for key in ("mount_attempt", "stale_unmount_attempt")):
+                raise RuntimeError("A prior mount is pending; reconcile with open/status before changing selection")
+            if previous.get("mount"):
+                raise RuntimeError("Close the saved mount before changing selection")
+        selection = selection_for(args.device, args.mountpoint or DEFAULT_MOUNT, args.access_mode or "rw")
         record = {"version": 1, "selection": selection, "mount": None}
         save_record(record)
         return {"selected": True, "mount_performed": False, "selection": selection}
     record = load_record()
     selection = record["selection"]
-    device = locate(selection)
+    mode = access_mode(selection)
     app = command("anylinuxfs", load_config())
+    try:
+        device = locate(selection)
+    except RuntimeError as error:
+        if str(error) != "Saved partition is not connected":
+            raise
+        if args.action == "close":
+            return close_disconnected(app, record)
+        if args.action == "status":
+            return {"selected": True, "connected": False,
+                    "mounted": os.path.ismount(selection["mountpoint"]),
+                    "access_mode": mode, "selection": selection,
+                    "mount_pending": bool(record.get("mount_attempt") or record.get("stale_unmount_attempt"))}
+        if args.action != "mode":
+            raise
+        device = None
     status = any_status(app)
     mountpoint = selection["mountpoint"]
     entries = parse_status(status)
+    if args.action == "mode":
+        if (record.get("mount") or record.get("mount_attempt") or record.get("stale_unmount_attempt")
+                or any(entry["mountpoint"] == mountpoint for entry in entries)
+                or (device and selected_mount(entries, device, mountpoint)) or os.path.ismount(mountpoint)
+                or (device and disk_info(device).get("MountPoint"))):
+            raise RuntimeError("Close the saved mount and reconcile pending operations before changing its mode")
+        selection["access_mode"] = args.device
+        if args.mountpoint is not None:
+            selection["mountpoint"] = mount_path(args.mountpoint)
+        save_record(record)
+        return {"selected": True, "mount_performed": False, "access_mode": args.device,
+                "read_only": args.device == "ro", "selection": selection}
     stale = owned_stale_mount(record, device, entries)
     if stale and args.action == "status":
         return stale
@@ -638,6 +765,7 @@ def operate(args):
     active = selected_mount(entries, device, mountpoint)
     if args.action == "status" and not active and not os.path.ismount(mountpoint):
         return {"selected": True, "connected": True, "mounted": False, "device": device,
+                "access_mode": mode, "read_only": mode == "ro",
                 "selection": selection, "mount_pending": bool(record.get("mount_attempt")),
                 "reconciliation_pending": bool(record.get("stale_unmount_attempt"))}
     require_sudo()
@@ -655,11 +783,13 @@ def operate(args):
         selection["filesystem_uuid"] = fs_uuid
         run(["/usr/bin/sudo", "-n", "/bin/mkdir", "-p", mountpoint])
         record["mount_attempt"] = {"device": device, "partition_uuid": selection["partition_uuid"],
+                                   "access_mode": mode,
                                    "operation_id": uuid.uuid4().hex}
         save_record(record)
         try:
-            run(["/usr/bin/sudo", "-n", app, Path(device).name, mountpoint, "-t", "ext4", "-o", "ro,noload",
-                 "-n", "ro", "--ignore-permissions", "--net-helper", "gvproxy", "-b", "127.0.0.1",
+            run(["/usr/bin/sudo", "-n", app, Path(device).name, mountpoint, "-t", "ext4", "-o",
+                 "ro,noload" if mode == "ro" else "rw", "-n", mode,
+                 "--ignore-permissions", "--net-helper", "gvproxy", "-b", "127.0.0.1",
                  "-w", "false"], timeout=120)
         except (RuntimeError, subprocess.TimeoutExpired) as error:
             raise RuntimeError(f"Mount completion is uncertain: {error}. Pending state retained; "
@@ -678,7 +808,8 @@ def operate(args):
     if args.action == "close":
         owned = record.get("mount")
         keys = ("partition_uuid", "filesystem_uuid", "device", "mountpoint", "host_source", "host_mount_id")
-        if not owned or any(owned.get(key) != verified.get(key) for key in keys):
+        if (not owned or any(owned.get(key) != verified.get(key) for key in keys)
+                or receipt_mode(owned) != mode):
             raise RuntimeError("No ownership receipt for this exact mount; leaving it unchanged")
         run(["/usr/bin/sudo", "-n", app, "unmount", mountpoint, "--wait-for-vm=20"], timeout=40)
         if os.path.ismount(mountpoint) or selected_mount(parse_status(any_status(app)), device, mountpoint):
@@ -696,13 +827,21 @@ def operate(args):
 
 def dispatch(argv=None):
     parser = argparse.ArgumentParser(prog="linux drive", description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("select", "open", "status", "close"), default="open")
-    parser.add_argument("device", nargs="?", help="Exact /dev/diskNsN partition, for select only")
-    parser.add_argument("--mountpoint", default=DEFAULT_MOUNT, help="Saved mount directory under /Volumes")
+    parser.add_argument("action", nargs="?", choices=("select", "open", "status", "close", "mode"), default="open")
+    parser.add_argument("device", nargs="?", help="Exact partition for select, or ro/rw for mode")
+    parser.add_argument("--mountpoint", help="Saved directory under /Volumes for select or an unmounted mode change")
     parser.add_argument("--filesystem", choices=("ext4",), default="ext4")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--read-only", dest="access_mode", action="store_const", const="ro")
+    modes.add_argument("--read-write", dest="access_mode", action="store_const", const="rw")
     args = parser.parse_args(argv)
-    if (args.action == "select") != bool(args.device):
+    if args.action == "mode":
+        if args.device not in ("ro", "rw"):
+            parser.error("mode requires ro or rw")
+    elif (args.action == "select") != bool(args.device):
         parser.error("select requires a partition; open/status/close use the saved selection")
+    if args.access_mode is not None and args.action != "select":
+        parser.error("--read-only/--read-write apply to select; use mode ro/rw on an unmounted saved selection")
     if platform.system() != "Darwin":
         raise RuntimeError("The saved-drive reader currently requires macOS and anylinuxfs")
     with drive_lock():

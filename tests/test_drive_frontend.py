@@ -41,7 +41,9 @@ class DriveFrontendTests(unittest.TestCase):
         def operate(args):
             self.assertTrue(self.locked, "the profile lock must cover native dispatch")
             self.assertEqual(vars(args), {"action": "open"})
-            return {"mounted": True, "read_only": True, "mountpoint": self.selection["mountpoint"]}
+            mode = frontend.drives.access_mode(self.selection)
+            return {"mounted": True, "read_only": mode == "ro", "access_mode": mode,
+                    "mountpoint": self.selection["mountpoint"]}
 
         self.stack.enter_context(patch.object(frontend, "state_dir", return_value=self.state))
         self.stack.enter_context(patch.object(frontend.platform, "system", return_value="Darwin"))
@@ -87,10 +89,85 @@ class DriveFrontendTests(unittest.TestCase):
         receipt = json.loads(Path(result["operation_receipt"]).read_text())
         self.assertEqual(receipt["state"], "completed")
         self.assertEqual(receipt["request"]["action"], "open-readonly")
+        self.assertEqual(receipt["request"]["access_mode"], "ro")
+        self.assertEqual(receipt["request"]["schema"], "o-linux.drive-request/v2")
+        self.assertEqual(receipt["authority"], "native-caller; fixed-open-operation; access-mode=ro")
+
+    def test_readwrite_declaration_dispatches_fixed_open_and_records_saved_mode(self):
+        self.selection["access_mode"] = "rw"
+        with patch.object(frontend.subprocess, "run", side_effect=self.declaration):
+            result = frontend.run_open()
+        self.assertTrue(result["mounted"])
+        self.assertFalse(result["read_only"])
+        self.assertEqual(result["access_mode"], "rw")
+        self.operate.assert_called_once_with(SimpleNamespace(action="open"))
+        receipt = json.loads(Path(result["operation_receipt"]).read_text())
+        self.assertEqual(receipt["state"], "completed")
+        self.assertEqual(receipt["request"]["action"], "open-readwrite")
+        self.assertEqual(receipt["request"]["access_mode"], "rw")
+        self.assertEqual(receipt["authority"], "native-caller; fixed-open-operation; access-mode=rw")
+
+    def test_metadata_request_binds_readonly_legacy_and_explicit_modes(self):
+        for mode, action in ((None, "open-readonly"), ("ro", "open-readonly"), ("rw", "open-readwrite")):
+            with self.subTest(mode=mode), patch.dict(os.environ, {}, clear=True):
+                if mode is None:
+                    self.selection.pop("access_mode", None)
+                else:
+                    self.selection["access_mode"] = mode
+                request = frontend.open_request()
+                self.assertEqual(request["access_mode"], mode or "ro")
+                self.assertEqual(request["action"], action)
+                self.assertEqual(request["selection_sha256"], frontend.selection_hash(self.selection))
+        self.operate.assert_not_called()
+        self.assertFalse((self.state / "runs").exists())
+
+    def test_o_request_cannot_override_saved_mode_in_either_direction(self):
+        for saved, forged in (("ro", "rw"), ("rw", "ro")):
+            self.selection["access_mode"] = saved
+            for fields in (("access_mode",), ("action",), ("access_mode", "action")):
+                with self.subTest(saved=saved, forged=forged, fields=fields):
+                    def response(argv, **kwargs):
+                        result = self.declaration(argv, **kwargs)
+                        document = json.loads(result.stdout)
+                        replacements = {"access_mode": forged,
+                                        "action": "open-readonly" if forged == "ro" else "open-readwrite"}
+                        for field in fields:
+                            document["value"]["v"][field]["v"]["utf8"] = replacements[field]
+                        result.stdout = json.dumps(document)
+                        return result
+                    with patch.object(frontend.subprocess, "run", side_effect=response), \
+                            self.assertRaisesRegex(RuntimeError, "invalid or stale"):
+                        frontend.run_open()
+                    self.operate.assert_not_called()
+        self.assertTrue(all(receipt["state"] == "declaration-rejected" for receipt in self.receipts()))
+
+    def test_access_mode_change_during_declaration_never_dispatches(self):
+        for original, replacement in (("ro", "rw"), ("rw", "ro")):
+            with self.subTest(original=original, replacement=replacement):
+                self.selection["access_mode"] = original
+                def response(argv, **kwargs):
+                    result = self.declaration(argv, **kwargs)
+                    self.selection["access_mode"] = replacement
+                    return result
+                with patch.object(frontend.subprocess, "run", side_effect=response), \
+                        self.assertRaisesRegex(RuntimeError, "selection changed"):
+                    frontend.run_open()
+        self.operate.assert_not_called()
+
+    def test_invalid_saved_mode_fails_before_o_or_native_dispatch(self):
+        for mode in (None, "", "read-write", "rw,noload", True, ["rw"]):
+            with self.subTest(mode=mode):
+                self.selection["access_mode"] = mode
+                with patch.object(frontend.subprocess, "run") as execute, self.assertRaises(RuntimeError):
+                    frontend.run_open()
+                execute.assert_not_called()
+        self.operate.assert_not_called()
+        self.assertFalse((self.state / "runs").exists())
 
     def test_wrong_request_fields_never_reach_native_operation(self):
         mutations = [
             ("schema", "different-schema"), ("action", "open-writable"),
+            ("access_mode", "rw"),
             ("nonce", "0" * 64), ("installation", "/other/state"),
             ("selection_sha256", "f" * 64), ("argv", ["arbitrary-command"]),
         ]

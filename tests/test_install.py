@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 import os
@@ -19,9 +20,10 @@ KEY = "ssh-ed25519 YWJj"
 
 class InstallTests(unittest.TestCase):
     def fake_install(self, root, *, existing=False, adopt=False, fault=None, initial_mounts=None, argv=None):
+        root = root.resolve()
         home, state = root / "home", root / "state"
         home.mkdir(exist_ok=True)
-        calls, mounts = [], dict(initial_mounts or {})
+        calls, mounts = [], copy.deepcopy(initial_mounts or {})
 
         def fake_run(argv, **kwargs):
             calls.append((argv, kwargs))
@@ -36,7 +38,16 @@ class InstallTests(unittest.TestCase):
             elif argv[1] == "info":
                 output = json.dumps({"info": {"o-linux": {"mounts": mounts}}})
             elif argv[1] == "mount":
-                mounts[argv[3].split(":", 1)[1]] = {"source_path": argv[2]}
+                if fault == "share-mount":
+                    raise RuntimeError("injected remount failure")
+                mounts[argv[3].split(":", 1)[1]] = {
+                    "source_path": argv[2],
+                    "uid_mappings": [argv[index + 1] for index, value in enumerate(argv) if value == "-u"],
+                    "gid_mappings": [argv[index + 1] for index, value in enumerate(argv) if value == "-g"]}
+            elif argv[1] == "umount":
+                if fault == "share-umount":
+                    raise RuntimeError("injected unmount failure")
+                mounts.pop(argv[2].split(":", 1)[1])
             elif argv[1] == "exec":
                 command = argv[4:]
                 if command[:2] == ["cloud-init", "status"]:
@@ -47,6 +58,8 @@ class InstallTests(unittest.TestCase):
                     output = json.dumps([{"addr_info": [{"local": "192.0.2.2", "prefixlen": 24}]}])
                 elif command[0] == "cat":
                     output = KEY + "\n"
+                elif command[0] == "id":
+                    output = "1000\n"
                 elif command[:2] == ["python3", "-"]:
                     output = "/usr/bin/python3\n/usr/sbin/nbd-client\n/usr/bin/ddrescue\n"
                 elif command[0] == "/usr/local/bin/mac":
@@ -61,16 +74,30 @@ class InstallTests(unittest.TestCase):
                 raise RuntimeError("injected post-config failure")
             return original_add_host_key(*args, **kwargs)
 
+        original_record = install.record_transaction
+        def record(*args, **kwargs):
+            transaction = args[1]
+            pending = next((item for item in transaction.get("mount_operations", [])
+                            if item["state"] == "unmounting"), None)
+            if pending and fault == "share-intent-write":
+                raise OSError("injected share intent write failure")
+            original_record(*args, **kwargs)
+            if pending and fault == "share-changed-after-intent":
+                mounts[pending["target"]]["source_path"] = "/different-source"
+
         with patch.object(install, "state_dir", return_value=state), \
                 patch.object(install.Path, "home", return_value=home), \
                 patch.object(install.platform, "system", return_value="Darwin"), \
                 patch.object(install.os, "geteuid", return_value=501), \
+                patch.object(install.os, "getuid", return_value=501), \
+                patch.object(install.os, "getgid", return_value=20), \
                 patch.object(install.getpass, "getuser", return_value="example"), \
                 patch.object(install.shutil, "which", side_effect=lambda name: "/tools/" + name), \
                 patch.object(install, "read_host_public_key", return_value=KEY), \
                 patch.object(install.socket, "create_connection"), \
                 patch.object(install, "run", side_effect=fake_run), \
                 patch.object(install, "add_host_key", side_effect=add_key), \
+                patch.object(install, "record_transaction", side_effect=record), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             result = install.main((["--adopt-existing"] if adopt else []) + (argv or []))
         return result, state, home, calls
@@ -144,6 +171,142 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(json.loads(path.read_text()), config)
             self.assertFalse(any(argv[1:3] == ["mount", "/Volumes"] for argv, _ in calls))
+
+    def share_fixture(self, home):
+        home = home.resolve()
+        return {str(home): {"source_path": str(home), "uid_mappings": ["501:default", "42:43"],
+                            "gid_mappings": ["20:default", "55:56"]},
+                "/Volumes": {"source_path": "/Volumes", "uid_mappings": ["501:default"],
+                             "gid_mappings": ["20:default"]}}
+
+    def mounted_from_calls(self, calls):
+        return {argv[3].split(":", 1)[1]: {
+            "source_path": argv[2],
+            "uid_mappings": [argv[index + 1] for index, value in enumerate(argv) if value == "-u"],
+            "gid_mappings": [argv[index + 1] for index, value in enumerate(argv) if value == "-g"]}
+                for argv, _ in calls if argv[1] == "mount"}
+
+    def test_root_mapping_plan_is_explicit_and_has_no_commands_or_mutations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder) / "absent"
+            for arguments, expected in ((["--plan"], False), (["--plan", "--map-root"], True)):
+                with self.subTest(arguments=arguments), \
+                        patch.object(install, "state_dir", return_value=state), \
+                        patch.object(install.platform, "system", return_value="Darwin"), \
+                        patch.object(install, "run", side_effect=AssertionError("unexpected command")), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(install.main(arguments), 0)
+                self.assertEqual(json.loads(output.getvalue())["configuration"]["share_root"], expected)
+            self.assertFalse(state.exists())
+
+    def test_new_root_mapped_shares_use_numeric_guest_ids_and_only_managed_sources(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result, state, home, calls = self.fake_install(Path(folder), argv=["--map-root"])
+            self.assertEqual(result, 0)
+            self.assertTrue(json.loads((state / "config.json").read_text())["share_root"])
+            mounts = self.mounted_from_calls(calls)
+            self.assertEqual(set(mounts), {str(home), "/Volumes"})
+            for target, mounted in mounts.items():
+                self.assertEqual(mounted["source_path"], target)
+                self.assertEqual(set(mounted["uid_mappings"]), {"501:1000", "0:0"})
+                self.assertEqual(set(mounted["gid_mappings"]), {"20:1000", "0:0"})
+            transaction = json.loads((state / "install-transaction.json").read_text())
+            self.assertIn("--map-root", transaction["retry_argv"])
+            self.assertTrue(all(item["state"] == "mounted" for item in transaction["mount_operations"]))
+
+    def test_root_upgrade_preserves_custom_mappings_and_rerun_does_not_remount(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = self.share_fixture(root / "home")
+            result, state, home, calls = self.fake_install(root, existing=True, adopt=True,
+                                                         initial_mounts=original, argv=["--map-root"])
+            self.assertEqual(result, 0)
+            upgraded = self.mounted_from_calls(calls)
+            self.assertEqual(set(upgraded[str(home)]["uid_mappings"]), {"0:0", "501:1000", "42:43"})
+            self.assertEqual(set(upgraded[str(home)]["gid_mappings"]), {"0:0", "20:1000", "55:56"})
+            unmounts = [argv for argv, _ in calls if argv[1] == "umount"]
+            self.assertEqual(unmounts, [["/tools/multipass", "umount", "o-linux:" + str(home)],
+                                        ["/tools/multipass", "umount", "o-linux:/Volumes"]])
+            # Multipass may report mappings in another order; order is not identity.
+            for mounted in upgraded.values():
+                mounted["uid_mappings"].reverse(); mounted["gid_mappings"].reverse()
+            result, _, _, calls = self.fake_install(root, existing=True, adopt=True, initial_mounts=upgraded)
+            self.assertEqual(result, 0)
+            self.assertTrue(json.loads((state / "config.json").read_text())["share_root"])
+            self.assertFalse(any(argv[1] in ("mount", "umount") for argv, _ in calls))
+
+    def test_root_mapping_conflicts_are_rejected_before_any_installation_mutation(self):
+        for field, conflict in (("uid_mappings", "0:42"), ("uid_mappings", "42:0"),
+                                ("gid_mappings", "0:55"), ("gid_mappings", "55:0")):
+            with self.subTest(field=field, conflict=conflict), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                mounts = {"/Volumes": {"source_path": "/Volumes", "uid_mappings": ["501:default"],
+                                       "gid_mappings": ["20:default"]}}
+                mounts["/Volumes"][field].append(conflict)
+                result, state, home, calls = self.fake_install(root, existing=True, adopt=True,
+                                                              initial_mounts=mounts, argv=["--map-root"])
+                self.assertEqual(result, 1)
+                self.assertFalse(state.exists())
+                self.assertFalse((home / ".ssh").exists())
+                self.assertFalse(any(argv[1] in ("start", "exec", "mount", "umount") for argv, _ in calls))
+
+    def test_failed_share_upgrade_keeps_custom_mappings_for_explicit_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = self.share_fixture(root / "home")
+            result, state, home, calls = self.fake_install(root, existing=True, adopt=True,
+                                                         initial_mounts=original, argv=["--map-root"], fault="share-mount")
+            self.assertEqual(result, 1)
+            transaction = json.loads((state / "install-transaction.json").read_text())
+            self.assertEqual(transaction["phase"], "shared-directories")
+            self.assertEqual(transaction["mount_operations"][0]["state"], "mounting")
+            self.assertIn("--map-root", transaction["retry_argv"])
+            self.assertIn("42:43", transaction["mount_operations"][0]["uid_mappings"])
+            # The first normal unmount succeeded, then mounting failed. The other
+            # original share is still present when the exact setup is retried.
+            original.pop(str(home))
+            result, _, _, calls = self.fake_install(root, existing=True, adopt=True, initial_mounts=original)
+            self.assertEqual(result, 0)
+            restored = self.mounted_from_calls(calls)
+            self.assertEqual(set(restored[str(home)]["uid_mappings"]), {"0:0", "501:1000", "42:43"})
+            self.assertEqual(set(restored[str(home)]["gid_mappings"]), {"0:0", "20:1000", "55:56"})
+
+    def test_failed_normal_unmount_does_not_attempt_replacement_mount(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            result, state, _, calls = self.fake_install(root, existing=True, adopt=True,
+                                                       initial_mounts=self.share_fixture(root / "home"),
+                                                       argv=["--map-root"], fault="share-umount")
+            self.assertEqual(result, 1)
+            self.assertFalse(any(argv[1] == "mount" for argv, _ in calls))
+            transaction = json.loads((state / "install-transaction.json").read_text())
+            self.assertEqual(transaction["mount_operations"][0]["state"], "unmounting")
+            self.assertEqual(transaction["status"], "incomplete")
+
+    def test_changed_share_or_failed_intent_write_prevents_unmount(self):
+        for fault in ("share-changed-after-intent", "share-intent-write"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                result, _, _, calls = self.fake_install(root, existing=True, adopt=True,
+                                                       initial_mounts=self.share_fixture(root / "home"),
+                                                       argv=["--map-root"], fault=fault)
+                self.assertEqual(result, 1)
+                self.assertFalse(any(argv[1] in ("umount", "mount") for argv, _ in calls))
+
+    def test_disabled_volumes_are_not_changed_by_root_mapping(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            mounts = self.share_fixture(root / "home")
+            mounts["/Volumes"]["uid_mappings"].append("0:42")
+            result, _, home, calls = self.fake_install(root, existing=True, adopt=True,
+                                                      initial_mounts=mounts, argv=["--map-root", "--no-volumes"])
+            self.assertEqual(result, 0)
+            self.assertEqual(set(self.mounted_from_calls(calls)), {str(home)})
+            self.assertFalse(any("o-linux:/Volumes" in argv for argv, _ in calls if argv[1] in ("mount", "umount")))
+
+    def test_mapping_defaults_cannot_hide_duplicate_guest_ids(self):
+        with self.assertRaisesRegex(RuntimeError, "one-to-one"):
+            install.resolved_mappings(["501:default", "42:1000"], 1000)
 
     def test_authorized_keys_preserves_unrelated_bytes(self):
         other = b'# comment\r\nssh-ed25519 ZGVm other key\r\n'

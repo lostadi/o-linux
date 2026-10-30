@@ -75,20 +75,20 @@ class DriveTests(unittest.TestCase):
     def disk_info(self, value):
         return copy.deepcopy(self.metadata[str(value).removeprefix("/dev/")])
 
-    def selection(self):
-        return drives.selection_for("/dev/disk9s3", self.mountpoint)
+    def selection(self, mode="ro"):
+        return drives.selection_for("/dev/disk9s3", self.mountpoint, mode)
 
     def identifiers(self):
         return ["/dev/" + name for name, info in self.metadata.items() if not info["WholeDisk"]]
 
-    def record(self, mount=None):
-        record = {"version": 1, "selection": self.selection(), "mount": mount}
+    def record(self, mount=None, mode="ro"):
+        record = {"version": 1, "selection": self.selection(mode), "mount": mount}
         drives.save_record(record)
         return record
 
-    def evidence(self):
+    def evidence(self, mode="ro"):
         guest_mount = "/mnt/" + Path(self.mountpoint).name
-        return {
+        result = {
             "status": f"disk9s3 on {self.mountpoint} (ext4, ro, noload, mounted by fixture) VM[cpus: 1, ram: 512 MiB]",
             "host": f"disk9s3.local:{guest_mount} on {self.mountpoint} (nfs, read-only, noowners)\n",
             ("cat", "/proc/mounts"): f"/dev/vda {guest_mount} ext4 ro,relatime,norecovery 0 0\n",
@@ -96,6 +96,13 @@ class DriveTests(unittest.TestCase):
             ("cat", "/etc/exports"): f'"{guest_mount}" *(ro,no_subtree_check,all_squash)\n',
             ("blkid", "-p", "-o", "export", "/dev/vda"): f"UUID={FILESYSTEM_UUID}\nTYPE=ext4\n",
         }
+        if mode == "rw":
+            result["status"] = result["status"].replace("ro, noload", "rw")
+            result["host"] = result["host"].replace("read-only, ", "")
+            result[("cat", "/proc/mounts")] = result[("cat", "/proc/mounts")].replace("ro,relatime,norecovery", "rw,relatime")
+            result[("cat", "/sys/class/block/vda/ro")] = "0"
+            result[("cat", "/etc/exports")] = result[("cat", "/etc/exports")].replace("(ro,", "(rw,")
+        return result
 
     @contextlib.contextmanager
     def verified_environment(self, evidence=None):
@@ -123,6 +130,75 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(selected["whole_bytes"], 2000)
         self.assertEqual(selected["filesystem"], "ext4")
         self.assertEqual(selected["mountpoint"], self.mountpoint)
+
+    def test_new_selections_default_to_rw_with_explicit_read_only_available(self):
+        for options, expected in (([], "rw"), (["--read-write"], "rw"), (["--read-only"], "ro")):
+            with self.subTest(options=options), patch.object(drives, "run") as external:
+                result = drives.dispatch(["select", "/dev/disk9s3", *options])
+            self.assertEqual(result["selection"]["access_mode"], expected)
+            self.assertEqual(result["selection"]["mountpoint"], "/Volumes/Linux-Drive")
+            external.assert_not_called()
+
+    def test_legacy_mode_is_read_only_without_rewriting_and_invalid_mode_is_rejected(self):
+        original = self.record()
+        original["selection"].pop("access_mode")
+        drives.save_record(original)
+        before = (self.state / "drives.json").read_bytes()
+        self.assertEqual(drives.access_mode(drives.load_record()["selection"]), "ro")
+        self.assertEqual((self.state / "drives.json").read_bytes(), before)
+        for invalid in ("", None, True, "read-write", [], {}):
+            with self.subTest(mode=invalid):
+                original["selection"]["access_mode"] = invalid
+                drives.save_record(original)
+                with self.assertRaisesRegex(RuntimeError, "access_mode"):
+                    drives.load_record()
+
+    def test_mode_changes_only_unmounted_metadata_and_preserves_identity(self):
+        original = self.record()
+        with patch.object(drives, "inventory", side_effect=self.identifiers), \
+                patch.object(drives, "any_status", return_value=""), \
+                patch.object(drives.os.path, "ismount", return_value=False), \
+                patch.object(drives, "require_sudo") as sudo, \
+                patch.object(drives, "run") as external:
+            for mode in ("rw", "ro"):
+                result = drives.dispatch(["mode", mode])
+                self.assertEqual(result["access_mode"], mode)
+                self.assertFalse(result["mount_performed"])
+                self.assertEqual(result["selection"], dict(original["selection"], access_mode=mode))
+        sudo.assert_not_called()
+        external.assert_not_called()
+
+    def test_mode_change_refuses_saved_live_or_pending_mount_without_state_change(self):
+        cases = ("receipt", "active", "host", "partition", "mount_attempt", "stale_unmount_attempt")
+        for case in cases:
+            with self.subTest(case=case):
+                original = self.record({"mounted": True} if case == "receipt" else None)
+                if case in ("mount_attempt", "stale_unmount_attempt"):
+                    original[case] = {"operation_id": "fixture"}
+                    drives.save_record(original)
+                self.metadata["disk9s3"]["MountPoint"] = "/Volumes/Other" if case == "partition" else ""
+                with patch.object(drives, "inventory", side_effect=self.identifiers), \
+                        patch.object(drives, "any_status", return_value=self.evidence()["status"] if case == "active" else ""), \
+                        patch.object(drives.os.path, "ismount", return_value=case == "host"), \
+                        patch.object(drives, "run") as external, \
+                        self.assertRaisesRegex(RuntimeError, "Close the saved mount"):
+                    drives.dispatch(["mode", "rw"])
+                self.assertEqual(drives.load_record(), original)
+                external.assert_not_called()
+
+    def test_mode_arguments_cannot_change_access_during_open(self):
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(drives, "operate") as operate:
+            for arguments in (["mode"], ["mode", "unknown"], ["open", "--read-write"],
+                              ["mode", "rw", "--read-only"], ["select", "/dev/disk9s3", "--read-only", "--read-write"]):
+                with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                    drives.dispatch(arguments)
+        operate.assert_not_called()
+
+    def test_reselection_cannot_discard_saved_mount_receipt(self):
+        original = self.record({"mounted": True})
+        with self.assertRaisesRegex(RuntimeError, "Close the saved mount"):
+            drives.dispatch(["select", "/dev/disk9s3", "--read-write"])
+        self.assertEqual(drives.load_record(), original)
 
     def test_locate_reidentifies_uuid_after_bsd_node_changes(self):
         selected = self.selection()
@@ -195,6 +271,76 @@ class DriveTests(unittest.TestCase):
                 changed[key] = value
                 with self.verified_environment(changed), self.assertRaises(RuntimeError):
                     drives.verify_mount("/tools/anylinuxfs", selected, "/dev/disk9s3")
+
+    def test_rw_verification_requires_all_layers_and_journal_replay_enabled(self):
+        evidence = self.evidence("rw")
+        selected = self.selection("rw")
+        with self.verified_environment(evidence):
+            receipt = drives.verify_mount("/tools/anylinuxfs", selected, "/dev/disk9s3")
+        self.assertFalse(receipt["read_only"])
+        self.assertEqual(receipt["access_mode"], "rw")
+        changes = [
+            ("status", evidence["status"].replace("ext4, rw", "ext4, ro")),
+            ("status", evidence["status"].replace("ext4, rw", "ext4, rw, noload")),
+            ("status", evidence["status"].replace("ext4, rw", "ext4, rw, norecovery")),
+            ("host", evidence["host"].replace("nfs, noowners", "nfs, read-only, noowners")),
+            ("host", evidence["host"].replace("nfs, noowners", "apfs, noowners")),
+            (("cat", "/proc/mounts"), evidence[("cat", "/proc/mounts")].replace("rw,relatime", "ro,relatime")),
+            (("cat", "/proc/mounts"), evidence[("cat", "/proc/mounts")].replace("rw,relatime", "rw,relatime,noload")),
+            (("cat", "/proc/mounts"), evidence[("cat", "/proc/mounts")].replace("rw,relatime", "rw,relatime,norecovery")),
+            (("cat", "/sys/class/block/vda/ro"), "1"),
+            (("cat", "/etc/exports"), evidence[("cat", "/etc/exports")].replace("(rw,", "(ro,")),
+            (("cat", "/etc/exports"), evidence[("cat", "/etc/exports")].replace("(rw,", "(rw,ro,")),
+        ]
+        for key, value in changes:
+            with self.subTest(layer=key, value=value):
+                changed = dict(evidence)
+                changed[key] = value
+                with self.verified_environment(changed), self.assertRaises(RuntimeError):
+                    drives.verify_mount("/tools/anylinuxfs", selected, "/dev/disk9s3")
+
+    def test_rw_open_reuses_verified_mount_and_close_requires_same_mode_receipt(self):
+        self.record(mode="rw")
+        evidence = self.evidence("rw")
+        with self.verified_environment(evidence) as run:
+            result = drives.dispatch(["open"])
+        self.assertFalse(result["read_only"])
+        self.assertFalse(any("unmount" in call.args[0] for call in run.call_args_list))
+        original = drives.load_record()
+        wrong = copy.deepcopy(original)
+        wrong["mount"]["access_mode"] = "ro"
+        wrong["mount"]["read_only"] = True
+        drives.save_record(wrong)
+        with self.verified_environment(evidence) as run, self.assertRaisesRegex(RuntimeError, "ownership receipt"):
+            drives.dispatch(["close"])
+        self.assertFalse(any("unmount" in call.args[0] for call in run.call_args_list))
+        drives.save_record(original)
+        with self.verified_environment(evidence) as run, \
+                patch.object(drives, "any_status", side_effect=[evidence["status"], ""]), \
+                patch.object(drives.os.path, "ismount", side_effect=[True, False]):
+            previous = run.side_effect
+            run.side_effect = lambda argv, **kwargs: (SimpleNamespace(returncode=0, stdout="", stderr="")
+                                                      if "unmount" in argv else previous(argv, **kwargs))
+            result = drives.dispatch(["close"])
+        self.assertTrue(result["closed"])
+        self.assertIsNone(drives.load_record()["mount"])
+
+    def test_legacy_owned_read_only_mount_can_close_before_mode_change(self):
+        self.record()
+        with self.verified_environment():
+            drives.dispatch(["open"])
+        legacy = drives.load_record()
+        legacy["selection"].pop("access_mode")
+        legacy["mount"].pop("access_mode")
+        drives.save_record(legacy)
+        with self.verified_environment() as run, \
+                patch.object(drives, "any_status", side_effect=[self.evidence()["status"], ""]), \
+                patch.object(drives.os.path, "ismount", side_effect=[True, False]):
+            previous = run.side_effect
+            run.side_effect = lambda argv, **kwargs: (SimpleNamespace(returncode=0, stdout="", stderr="")
+                                                      if "unmount" in argv else previous(argv, **kwargs))
+            self.assertTrue(drives.dispatch(["close"])["closed"])
+        self.assertEqual(drives.access_mode(drives.load_record()["selection"]), "ro")
 
     def test_open_reuses_verified_mount_without_remounting(self):
         self.record()
@@ -386,14 +532,14 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(receipt["host_source"], "disk9s3.local:/mnt/Copy on Backup")
 
     @contextlib.contextmanager
-    def stale_environment(self):
-        evidence = self.evidence()
-        owned = {"mounted": True, "read_only": True, "device": "/dev/disk9s3",
+    def stale_environment(self, mode="ro"):
+        evidence = self.evidence(mode)
+        owned = {"mounted": True, "read_only": mode == "ro", "access_mode": mode, "device": "/dev/disk9s3",
                  "mountpoint": self.mountpoint, "partition_uuid": PARTITION_UUID,
                  "filesystem_uuid": FILESYSTEM_UUID, "filesystem": "ext4",
                  "host_source": "disk9s3.local:/mnt/" + Path(self.mountpoint).name,
                  "host_mount_id": 77}
-        self.record(owned)
+        self.record(owned, mode)
         self.metadata = disk_fixture(12)
         state = {"phase": "stale", "failure": None, "host_mount_id": 77,
                  "present_nodes": set(), "inaccessible_nodes": set(), "events": [],
@@ -502,6 +648,60 @@ class DriveTests(unittest.TestCase):
         self.assertNotIn("mount_attempt", record)
         self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
         self.assertFalse(any("--force" in item for item in state["events"]))
+
+    def test_stale_rw_mount_reconnects_with_rw_options_and_mode_bound_receipts(self):
+        with self.stale_environment("rw") as state:
+            status = drives.dispatch(["status"])
+            self.assertEqual(status["access_mode"], "rw")
+            self.assertFalse(status["read_only"])
+            result = drives.dispatch(["open"])
+            record = drives.load_record()
+        self.assertEqual(result["access_mode"], "rw")
+        self.assertFalse(result["read_only"])
+        self.assertEqual(record["mount"]["access_mode"], "rw")
+        self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+        mount = next(item for item in state["events"] if item[:4] == ["/usr/bin/sudo", "-n", "/tools/anylinuxfs", "disk12s3"])
+        self.assertEqual(mount[mount.index("-o") + 1], "rw")
+        self.assertEqual(mount[mount.index("-n", 3) + 1], "rw")
+        self.assertEqual(mount[mount.index("-w") + 1], "false")
+        self.assertNotIn("ro,noload", mount)
+
+    def test_rw_stale_retry_does_not_accept_a_pending_read_only_intent(self):
+        with self.stale_environment("rw") as state:
+            state["failure"] = "lost-response"
+            with self.assertRaisesRegex(RuntimeError, "completion is unknown"):
+                drives.dispatch(["open"])
+            record = drives.load_record()
+            self.assertEqual(record["stale_unmount_attempt"]["access_mode"], "rw")
+            record["stale_unmount_attempt"]["access_mode"] = "ro"
+            drives.save_record(record)
+            with self.assertRaisesRegex(RuntimeError, "intent does not match"):
+                drives.dispatch(["open"])
+            self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+            self.assertEqual(drives.load_record(), record)
+
+    def test_rw_mount_uncertainty_retains_mode_and_never_retries_dispatch(self):
+        self.record(mode="rw")
+        observed = []
+        def external(argv, **kwargs):
+            observed.append(argv)
+            if "/tools/anylinuxfs" in argv:
+                self.assertEqual(drives.load_record()["mount_attempt"]["access_mode"], "rw")
+                raise RuntimeError("mount result lost")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(drives, "locate", return_value="/dev/disk9s3"), \
+                patch.object(drives, "any_status", return_value=""), \
+                patch.object(drives, "require_sudo"), \
+                patch.object(drives, "signature", return_value=FILESYSTEM_UUID), \
+                patch.object(drives.os.path, "ismount", return_value=False), \
+                patch.object(drives, "run", side_effect=external):
+            with self.assertRaisesRegex(RuntimeError, "completion is uncertain"):
+                drives.dispatch(["open"])
+            with self.assertRaisesRegex(RuntimeError, "completion is unknown"):
+                drives.dispatch(["open"])
+        self.assertEqual(sum("/tools/anylinuxfs" in argv for argv in observed), 1)
+        self.assertFalse(any("unmount" in argv for argv in observed))
+        self.assertEqual(drives.load_record()["mount_attempt"]["access_mode"], "rw")
 
     def test_stale_receipt_mismatches_never_trigger_teardown(self):
         changes = [("partition_uuid", "66666666-7777-8888-9999-000000000000"),

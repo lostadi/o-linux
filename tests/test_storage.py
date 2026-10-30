@@ -18,9 +18,12 @@ from olinux import storage
 OPERATION = "a" * 32
 
 
-def operation_state():
-    return {"operation_id": OPERATION, "instance": "test-vm", "status": "pending",
-            "export": "o-linux-readonly-" + OPERATION}
+def operation_state(mode=None):
+    result = {"operation_id": OPERATION, "instance": "test-vm", "status": "pending",
+              "export": "o-linux-readonly-" + OPERATION if mode is None else "o-linux-" + mode + "-" + OPERATION}
+    if mode is not None:
+        result["access_mode"] = mode
+    return result
 
 
 class GuestFixture:
@@ -33,15 +36,26 @@ class GuestFixture:
         self.device = self.blocks / "nbd7"
         self.device.mkdir(parents=True)
         (self.device / "size").write_text("0")
+        (self.device / "dev").write_text("43:224")
+        (self.device / "holders").mkdir()
+        (self.processes / "self").mkdir(parents=True)
+        (self.processes / "self/mountinfo").write_text("")
+        (self.processes / "swaps").write_text("Filename\tType\tSize\tUsed\tPriority\n")
         process = self.processes / "321"
         process.mkdir(parents=True)
         (process / "stat").write_text("321 (nbd-client) S " + "0 " * 18 + "777 0")
         self.disconnections = []
         self.attach_error = None
         self.attachment_commands = []
+        self.block_read_only = "1\n"
+        self.flushes = []
+        self.flush_error = None
 
     def run_command(self, argv, **kwargs):
-        if argv[0] == "nbd-client" and "-d" in argv:
+        if argv[:2] == ["blockdev", "--flushbufs"]:
+            self.flushes.append(argv[-1])
+            if self.flush_error: raise self.flush_error
+        elif argv[0] == "nbd-client" and "-d" in argv:
             if not kwargs.get("capture_output"):
                 print("disconnect, sock, done")
             self.disconnections.append(argv[-1])
@@ -63,7 +77,7 @@ class GuestFixture:
         output, namespace = io.StringIO(), {}
         with patch.object(sys, "argv", ["-", *args]), \
                 patch.object(subprocess, "run", side_effect=self.run_command), \
-                patch.object(subprocess, "check_output", return_value="1\n"), \
+                patch.object(subprocess, "check_output", side_effect=lambda *args, **kwargs: self.block_read_only), \
                 contextlib.redirect_stdout(output):
             try:
                 exec(script, namespace)
@@ -94,7 +108,7 @@ def disk_fixture():
 
 
 class PhysicalSourceTests(unittest.TestCase):
-    def inspect(self, info=None, listing=None, child=None, mode=stat.S_IFBLK):
+    def inspect(self, info=None, listing=None, child=None, mode=stat.S_IFBLK, host_mounts="", anylinuxfs_status=None):
         default_info, default_listing, default_child = disk_fixture()
         responses = {("info", "-plist", "/dev/disk999"): info or default_info,
                      ("list", "-plist", "/dev/disk999"): listing or default_listing,
@@ -102,6 +116,9 @@ class PhysicalSourceTests(unittest.TestCase):
         node = SimpleNamespace(st_mode=mode, st_rdev=99, st_ino=42, st_ctime_ns=17)
         with patch.object(storage, "disk_plist", side_effect=lambda *args: responses[args]), \
                 patch.object(storage.os, "lstat", return_value=node), \
+                patch.object(storage.shutil, "which", return_value="/tools/anylinuxfs" if anylinuxfs_status is not None else None), \
+                patch.object(storage, "run", side_effect=lambda argv: SimpleNamespace(
+                    stdout=host_mounts if argv == ["/sbin/mount"] else anylinuxfs_status, stderr="", returncode=0)), \
                 patch.object(storage.os, "open") as opened:
             result = storage.inspect_device("/dev/disk999", 1000000)
         opened.assert_not_called()
@@ -137,6 +154,17 @@ class PhysicalSourceTests(unittest.TestCase):
         info["MountPoint"] = "/Volumes/fixture"
         with self.assertRaisesRegex(RuntimeError, "mounted"):
             self.inspect(info=info)
+
+    def test_anylinuxfs_nfs_mount_or_instance_blocks_raw_disk_despite_empty_diskutil_mountpoint(self):
+        for source in ("disk999", "disk999s1"):
+            with self.subTest(source=source), self.assertRaisesRegex(RuntimeError, "active anylinuxfs NFS"):
+                self.inspect(host_mounts=source + ".local:/mnt/External on /Volumes/External (nfs, noowners)\n")
+            with self.subTest(instance=source), self.assertRaisesRegex(RuntimeError, "active anylinuxfs instance"):
+                self.inspect(anylinuxfs_status=source + " on /Volumes/External (ext4, rw)\n")
+        self.inspect(host_mounts="disk9991s1.local:/mnt/Other on /Volumes/Other (nfs, noowners)\n",
+                     anylinuxfs_status="disk9991s1 on /Volumes/Other (ext4, rw)")
+        with self.assertRaisesRegex(RuntimeError, "Unrecognized anylinuxfs"):
+            self.inspect(anylinuxfs_status="incomplete instance")
 
     def test_unresolved_compound_storage_and_wrong_node_type_are_rejected(self):
         for content in ("Apple_APFS", "Apple_CoreStorage", "Apple_RAID"):
@@ -194,6 +222,49 @@ class ImageSourceTests(unittest.TestCase):
         self.assertEqual(argv[-1], "/dev/fd/73")
         self.assertNotIn("--snapshot", argv)
 
+    def test_rw_descriptor_updates_pinned_original_without_touching_replacement_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "fixture.raw"
+            original = Path(temporary) / "retained.raw"
+            image.write_bytes(b"original image bytes")
+            source, fd = storage.open_image(image, "rw")
+            try:
+                self.assertEqual(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDWR)
+                image.rename(original)
+                image.write_bytes(b"replacement unchanged")
+                os.write(fd, b"UPDATED!")
+                os.fsync(fd)
+                self.assertTrue(original.read_bytes().startswith(b"UPDATED!"))
+                self.assertEqual(image.read_bytes(), b"replacement unchanged")
+            finally:
+                os.close(fd)
+        with patch.object(storage, "QEMU_NBD", "/tools/qemu-nbd"):
+            arguments = storage.server_arguments(73, "fixture-rw", "rw")
+        self.assertNotIn("--read-only", arguments)
+        self.assertNotIn("--snapshot", arguments)
+        self.assertEqual(arguments[-1], "/dev/fd/73")
+        self.assertIn("--shared=1", arguments)
+
+    def test_rw_open_permission_failure_has_no_read_only_fallback_or_source_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "fixture.raw"
+            image.write_bytes(b"retained source bytes")
+            with patch.object(storage.os, "open", side_effect=PermissionError("fixture denied")) as opened:
+                with self.assertRaisesRegex(PermissionError, "fixture denied"):
+                    storage.open_image(image, "rw")
+            opened.assert_called_once()
+            self.assertEqual(opened.call_args.args[1] & os.O_ACCMODE, os.O_RDWR)
+            self.assertEqual(image.read_bytes(), b"retained source bytes")
+
+    def test_invalid_mode_fails_before_source_open_or_server_arguments(self):
+        for invalid in ("", "readwrite", None, True):
+            with self.subTest(mode=invalid), patch.object(storage.os, "open") as opened:
+                with self.assertRaisesRegex(RuntimeError, "access_mode"):
+                    storage.open_image("/must/not/open", invalid)
+                with self.assertRaisesRegex(RuntimeError, "access_mode"):
+                    storage.server_arguments(73, mode=invalid)
+            opened.assert_not_called()
+
 
 class LifecycleTests(unittest.TestCase):
     def test_help_needs_no_configuration_or_processes(self):
@@ -220,6 +291,41 @@ class LifecycleTests(unittest.TestCase):
             with self.subTest(port=port), self.assertRaisesRegex(RuntimeError, "ports"):
                 storage.configure({"multipass": "/tools/mp", "qemu_nbd": "/tools/nbd",
                                    "guest_user": "ubuntu", "nbd_host_port": port})
+
+    def test_cleanup_mode_overrides_are_rejected_and_pending_operation_blocks_new_source(self):
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(storage, "load_config") as load:
+            for arguments in (["--cleanup-pending", "--read-write"], ["--cleanup-pending", "--read-only"],
+                              ["fixture.raw", "--read-write", "--read-only"]):
+                with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                    storage.main(arguments)
+        load.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "storage"; base.mkdir()
+            state = operation_state("ro")
+            path = base / "state.json"; path.write_text(json.dumps(state))
+            config = {"multipass": "/tools/mp", "qemu_nbd": "/tools/nbd", "guest_user": "ubuntu",
+                      "instance": "test-vm", "storage_access_mode": "rw"}
+            with patch.object(storage, "load_config", return_value=config), \
+                    patch.object(storage, "state_dir", return_value=Path(temporary)), \
+                    patch.object(storage, "open_image") as opened, \
+                    patch.object(storage, "inspect_device") as inspected, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                storage.main(["/must/not/open", "--read-write"])
+            opened.assert_not_called(); inspected.assert_not_called()
+            self.assertEqual(json.loads(path.read_text()), state)
+
+    def test_cli_configuration_and_override_reach_source_opener(self):
+        for configured, option, expected in ((None, [], "ro"), ("rw", [], "rw"),
+                                             ("rw", ["--read-only"], "ro"), ("ro", ["--read-write"], "rw")):
+            with self.subTest(configured=configured, option=option), tempfile.TemporaryDirectory() as temporary:
+                config = {"multipass": "/tools/mp", "qemu_nbd": "/tools/nbd", "guest_user": "ubuntu", "instance": "test-vm"}
+                if configured is not None: config["storage_access_mode"] = configured
+                with patch.object(storage, "load_config", return_value=config), \
+                        patch.object(storage, "state_dir", return_value=Path(temporary)), \
+                        patch.object(storage, "open_image", side_effect=PermissionError("fixture stop")) as opened, \
+                        self.assertRaisesRegex(PermissionError, "fixture stop"):
+                    storage.main(["/fixture.raw", *option])
+                opened.assert_called_once_with(Path("/fixture.raw"), expected)
 
     def test_cleanup_disconnects_owned_mapping_and_removes_state(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -248,6 +354,42 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(stop.call_count, 2)
             with self.assertRaises(OSError): os.fstat(fd)
 
+    def test_failed_rw_cleanup_retains_server_tunnel_and_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            original = dict(operation_state("rw"), status="attached", device="/dev/nbd7", client_pid="321")
+            path.write_text(json.dumps(original))
+            fd = os.open(path, os.O_RDONLY)
+            with patch.object(storage, "STATE", path), \
+                    patch.object(storage, "disconnect_operation", side_effect=RuntimeError("guest filesystem mounted")), \
+                    patch.object(storage, "stop") as stop, contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertFalse(storage.cleanup("test-vm", original, Mock(), Mock(), fd))
+            stop.assert_not_called()
+            self.assertEqual(json.loads(path.read_text()), original)
+            self.assertIn("Retaining the read-write NBD server", errors.getvalue())
+            with self.assertRaises(OSError): os.fstat(fd)
+
+    def test_physical_preflight_uses_shared_drive_lock_and_releases_it_after_failure(self):
+        from olinux import drives
+        events = []
+        @contextlib.contextmanager
+        def guard():
+            events.append("locked")
+            try: yield
+            finally: events.append("unlocked")
+        def inspect(*args):
+            self.assertEqual(events, ["locked"])
+            raise RuntimeError("fixture preflight stop")
+        with tempfile.TemporaryDirectory() as temporary:
+            config = {"multipass": "/tools/mp", "qemu_nbd": "/tools/nbd", "guest_user": "ubuntu", "instance": "test-vm"}
+            with patch.object(storage, "load_config", return_value=config), \
+                    patch.object(storage, "state_dir", return_value=Path(temporary)), \
+                    patch.object(drives, "drive_lock", side_effect=guard), \
+                    patch.object(storage, "inspect_device", side_effect=inspect), \
+                    self.assertRaisesRegex(RuntimeError, "fixture preflight stop"):
+                storage.main(["--device", "/dev/disk999", "--expected-size", "1000000", "--read-write"])
+        self.assertEqual(events, ["locked", "unlocked"])
+
     def test_process_cleanup_escalates_only_owned_process(self):
         process = Mock()
         process.poll.return_value = None
@@ -257,6 +399,132 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ReceiptRecoveryTests(unittest.TestCase):
+    def test_rw_guest_attachment_and_cleanup_preserve_mode_and_actual_block_flags(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            host = Path(temporary) / "host"; host.mkdir()
+            fixture = GuestFixture(Path(temporary) / "guest")
+            fixture.block_read_only = "0\n"
+            state = operation_state("rw")
+            with patch.object(storage, "BASE", host), patch.object(storage, "STATE", host / "state.json"), \
+                    patch.object(storage, "guest", side_effect=fixture.guest):
+                result = storage.attach("test-vm", state)
+                self.assertFalse(result["read_only"])
+                self.assertEqual(result["access_mode"], "rw")
+                self.assertNotIn("-R", fixture.attachment_commands[0])
+                self.assertEqual(fixture.receipt()["access_mode"], "rw")
+                cleaned = storage.disconnect_operation("test-vm", state)
+            self.assertTrue(cleaned["clean"])
+            self.assertEqual(cleaned["access_mode"], "rw")
+            self.assertEqual(fixture.disconnections, ["/dev/nbd7"])
+            self.assertEqual(fixture.flushes, ["/dev/nbd7"])
+
+    def test_rw_mounted_device_partition_or_holder_is_not_flushed_or_disconnected(self):
+        for use in ("device", "partition", "holder"):
+            with self.subTest(use=use), tempfile.TemporaryDirectory() as temporary:
+                fixture = GuestFixture(temporary); fixture.block_read_only = "0\n"
+                state = operation_state("rw")
+                fixture.invoke(storage.CONNECT, ["test-vm", OPERATION, "10819", state["export"], "rw"])
+                if use == "holder":
+                    (fixture.device / "holders/dm-0").touch()
+                else:
+                    number = "43:224"
+                    if use == "partition":
+                        part = fixture.blocks / "nbd7p1"; part.mkdir()
+                        (part / "holders").mkdir(); (part / "dev").write_text("259:1")
+                        number = "259:1"
+                    (fixture.processes / "self/mountinfo").write_text("1 2 " + number + " / /mnt rw - ext4 /dev/nbd7 rw\n")
+                before = fixture.receipt()
+                with self.assertRaisesRegex(RuntimeError, "mounted|active holders"):
+                    fixture.invoke(storage.DISCONNECT, ["test-vm", OPERATION, "-", "-", "rw", state["export"]])
+                self.assertEqual(fixture.disconnections, [])
+                self.assertEqual(fixture.flushes, [])
+                self.assertEqual(fixture.receipt(), before)
+
+    def test_rw_cleanup_never_flushes_changed_owner_and_retains_flush_failure(self):
+        for failure in ("owner", "flush"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                fixture = GuestFixture(temporary); fixture.block_read_only = "0\n"
+                state = operation_state("rw")
+                fixture.invoke(storage.CONNECT, ["test-vm", OPERATION, "10819", state["export"], "rw"])
+                if failure == "owner": (fixture.device / "pid").write_text("999")
+                else: fixture.flush_error = RuntimeError("flush did not complete")
+                with self.assertRaisesRegex(RuntimeError, "ownership changed|flush did not complete"):
+                    fixture.invoke(storage.DISCONNECT, ["test-vm", OPERATION, "-", "-", "rw", state["export"]])
+                self.assertEqual(fixture.disconnections, [])
+                self.assertEqual(fixture.flushes, [] if failure == "owner" else ["/dev/nbd7"])
+                self.assertEqual(fixture.receipt()["status"], "attached")
+
+    def test_rw_active_swap_device_or_partition_alias_is_not_flushed_or_disconnected(self):
+        for partition in (False, True):
+            with self.subTest(partition=partition), tempfile.TemporaryDirectory() as temporary:
+                fixture = GuestFixture(temporary); fixture.block_read_only = "0\n"
+                state = operation_state("rw")
+                fixture.invoke(storage.CONNECT, ["test-vm", OPERATION, "10819", state["export"], "rw"])
+                major, minor = 43, 224
+                if partition:
+                    part = fixture.blocks / "nbd7p1"; part.mkdir()
+                    (part / "holders").mkdir(); (part / "dev").write_text("43:225")
+                    major, minor = 43, 225
+                (fixture.processes / "swaps").write_text("Filename\tType\tSize\tUsed\tPriority\n/dev/swap-alias partition 1024 64 -2\n")
+                original_stat = os.stat
+                def device_stat(path, *args, **kwargs):
+                    if str(path) == "/dev/swap-alias":
+                        return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=os.makedev(major, minor))
+                    return original_stat(path, *args, **kwargs)
+                with patch.object(os, "stat", side_effect=device_stat), self.assertRaisesRegex(RuntimeError, "active swap"):
+                    fixture.invoke(storage.DISCONNECT, ["test-vm", OPERATION, "-", "-", "rw", state["export"]])
+                self.assertEqual(fixture.disconnections, [])
+                self.assertEqual(fixture.flushes, [])
+                self.assertEqual(fixture.receipt()["status"], "attached")
+
+    def test_guest_block_mode_mismatch_retains_owned_receipt_for_cleanup(self):
+        for mode, reported in (("rw", "1\n"), ("ro", "0\n")):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                fixture = GuestFixture(temporary); fixture.block_read_only = reported
+                state = operation_state(mode)
+                with self.assertRaisesRegex(RuntimeError, "does not match requested"):
+                    fixture.invoke(storage.CONNECT, ["test-vm", OPERATION, "10819", state["export"], mode])
+                receipt = fixture.receipt()
+                self.assertEqual(receipt["status"], "attached")
+                self.assertEqual(receipt["client_pid"], "321")
+                self.assertNotIn("read_only", receipt)
+                fixture.invoke(storage.DISCONNECT, ["test-vm", OPERATION, "-", "-", mode, state["export"]])
+                self.assertEqual(fixture.disconnections, ["/dev/nbd7"])
+
+    def test_cleanup_and_host_receipt_reject_mode_or_export_substitution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = GuestFixture(temporary); fixture.block_read_only = "0\n"
+            state = operation_state("rw")
+            result = fixture.invoke(storage.CONNECT, ["test-vm", OPERATION, "10819", state["export"], "rw"])
+            for mode, export in (("ro", state["export"]), ("rw", "wrong-export")):
+                with self.subTest(mode=mode, export=export), self.assertRaisesRegex(RuntimeError, "receipts disagree"):
+                    fixture.invoke(storage.DISCONNECT, ["test-vm", OPERATION, "-", "-", mode, export])
+            self.assertEqual(fixture.disconnections, [])
+            for changed in (dict(state, access_mode="ro"), dict(state, export="wrong-export")):
+                with self.assertRaises(RuntimeError):
+                    storage.receipt_response(result.stdout, changed)
+            self.assertEqual(storage.receipt_response(result.stdout, state)["access_mode"], "rw")
+
+    def test_rw_lost_result_recovers_receipt_without_source_reopen(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            host = Path(temporary) / "host"; host.mkdir()
+            fixture = GuestFixture(Path(temporary) / "guest"); fixture.block_read_only = "0\n"
+            state = operation_state("rw")
+            path = host / "state.json"
+            def lose_result(instance, args, **kwargs):
+                result = fixture.guest(instance, args, **kwargs)
+                if args[4] == storage.CONNECT: raise subprocess.TimeoutExpired("lost reply", 45)
+                return result
+            with patch.object(storage, "BASE", host), patch.object(storage, "STATE", path), \
+                    patch.object(storage, "guest", side_effect=lose_result), \
+                    patch.object(storage, "open_image") as opened:
+                with self.assertRaises(subprocess.TimeoutExpired): storage.attach("test-vm", state)
+                self.assertEqual(json.loads(path.read_text())["access_mode"], "rw")
+                self.assertTrue(storage.cleanup("test-vm", state, None, None, None))
+            opened.assert_not_called()
+            self.assertFalse(path.exists())
+            self.assertEqual(fixture.disconnections, ["/dev/nbd7"])
+
     def test_lost_client_result_reconciles_guest_receipt_and_cleans_mapping(self):
         failures = [subprocess.TimeoutExpired("multipass", 45), RuntimeError("client exited"),
                     "not json", KeyboardInterrupt()]
