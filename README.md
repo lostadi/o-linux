@@ -103,9 +103,22 @@ brew trust nohajc/anylinuxfs
 brew install anylinuxfs
 ```
 
-Selection records metadata in the private `drives.json` file and does not mount the partition or require sudo. `--mountpoint /Volumes/Your-ReadOnly-Drive` chooses the saved mount location; otherwise the default is `/Volumes/Linux-Drive-ReadOnly`. Run `sudo -v` in your terminal before open, status, or close when cached authorization is unavailable; these operations use noninteractive sudo for guest evidence and mount operations.
+Selection records metadata in the private `drives.json` file and does not mount the partition or require sudo. `--mountpoint /Volumes/Your-ReadOnly-Drive` chooses the saved mount location; otherwise the default is `/Volumes/Linux-Drive-ReadOnly`. Open, verification of an active mount, and close need macOS authorization. An interactive command requests it in the same Mac session when needed; a captured command fails clearly if authorization is unavailable.
+
+The same `o-linux drive` commands work inside the provisioned Ubuntu guest. They use the pinned Mac bridge and the Mac's saved selection. A host-only dispatch guard rejects a wrongly configured non-Mac destination. Standalone Linux installations without this bridge cannot use the anylinuxfs reader.
+
+`lsblk` in Ubuntu lists the guest's block devices. A drive opened by this filesystem workflow remains mounted on the Mac and does not become a guest block device. If the shared `/Volumes` path is inaccessible, use the host command bridge to read it:
+
+```sh
+mac ls /Volumes/Linux-Drive-ReadOnly
+mac cat /Volumes/Linux-Drive-ReadOnly/path/to/file > recovered-file
+```
+
+The second command writes a copy into the guest's current directory. Host permissions still apply to the source.
 
 `o-linux drive` and `o-linux drive open` evaluate the installed `.O` document to obtain a typed, fixed read-only request bound to the saved selection's digest. The native host adapter validates the returned request against the current saved selection before performing the privileged operation. Selection and status use the metadata interface; close explicitly closes the saved selection. Opening an ext4 selection requires both `ro,noload` on the Linux filesystem and a read-only NFS presentation to macOS. An already-active matching mount is reused only after those read-only properties and the physical filesystem identity are verified.
+
+After a disconnect, macOS may assign the same partition a new disk number while its old mount remains. Status reports an identified stale mount without changing it. Open can retire that mount and reopen the selected partition only when the old devices are absent or positively identified as inactive, the exact saved mount receipt still matches, and the current physical filesystem has the saved UUID. Retained device nodes must match inactive IOMedia records for the saved partition and whole-disk sizes and be absent from the active disk inventory. Teardown intent is saved before normal unmount; uncertain completion is retained and never triggers repeated teardown. Conflicting or unowned mounts are left untouched.
 
 The same saved selection has a fixed `.O` entry point installed with the application. To inspect its structured request without mounting anything, invoke it directly with the absolute path to your installed OSTADIX backends:
 

@@ -10,6 +10,7 @@ import platform
 import plistlib
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -169,8 +170,15 @@ def drive_lock():
 
 
 def require_sudo():
-    if run(["/usr/bin/sudo", "-n", "/usr/bin/true"], check=False).returncode:
-        raise RuntimeError("Run sudo -v in your terminal, then retry this command")
+    probe = ["/usr/bin/sudo", "-n", "/usr/bin/true"]
+    if not run(probe, check=False).returncode:
+        return
+    if all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr)):
+        # Keep authentication and subsequent sudo calls in this same host PTY.
+        if not subprocess.call(["/usr/bin/sudo", "-v"]) and not run(probe, check=False).returncode:
+            return
+    raise RuntimeError("macOS authorization required; run o-linux drive in an interactive terminal "
+                       "and authenticate there (sudo -v runs in that same host session)")
 
 
 def any_status(app):
@@ -403,9 +411,208 @@ def signature(device, expected_uuid):
     return result
 
 
+OWNED_MOUNT_KEYS = ("partition_uuid", "filesystem_uuid", "device", "mountpoint", "host_source", "host_mount_id")
+
+
+def registry_media(document):
+    """Deduplicate ioreg's overlapping roots while retaining media ancestry."""
+    if not isinstance(document, list):
+        raise RuntimeError("Unrecognized IOMedia registry metadata")
+    fields = ("BSD Name", "BSD Major", "BSD Minor", "IOObjectClass", "IOServiceState", "Size", "Whole", "UUID")
+    media = {}
+    pending = [(node, None) for node in document]
+    while pending:
+        node, parent = pending.pop()
+        if not isinstance(node, dict):
+            raise RuntimeError("Unrecognized IOMedia registry node")
+        if node.get("IOObjectClass") == "IOMedia" or "BSD Name" in node:
+            identity = node.get("IORegistryEntryID")
+            if type(identity) is not int or identity <= 0:
+                raise RuntimeError("Missing IOMedia registry identity")
+            values = {key: node.get(key) for key in fields}
+            previous = media.get(identity)
+            if previous and any(type(previous["values"][key]) is not type(values[key])
+                                or previous["values"][key] != values[key] for key in fields):
+                raise RuntimeError("Conflicting copies of an IOMedia registry entry")
+            entry = media.setdefault(identity, {"values": values, "parents": set()})
+            if parent is not None:
+                entry["parents"].add(parent)
+            parent = identity
+        children = node.get("IORegistryEntryChildren", [])
+        if not isinstance(children, list):
+            raise RuntimeError("Unrecognized IOMedia registry children")
+        pending.extend((child, parent) for child in children)
+    return media
+
+
+def previous_device_detached(device, selection):
+    """Allow absent nodes or positively inactive retained IOMedia, without reads."""
+    nodes = []
+    for path in (device, "/dev/r" + Path(device).name):
+        try:
+            nodes.append(os.lstat(path))
+        except FileNotFoundError:
+            nodes.append(None)
+        except OSError as error:
+            raise RuntimeError("Cannot establish that the previous drive node is detached: " + path) from error
+    if nodes == [None, None]:
+        return "absent"
+    block, raw = nodes
+    if (block is None or raw is None or not stat.S_ISBLK(block.st_mode)
+            or not stat.S_ISCHR(raw.st_mode) or block.st_rdev != raw.st_rdev):
+        raise RuntimeError("Previous drive nodes still exist without a matching block/raw pair; mount unchanged")
+    name = Path(device).name
+    whole = re.fullmatch(r"(disk[0-9]+)s[0-9]+", name)
+    if not whole:
+        raise RuntimeError("Invalid previous partition device")
+    whole = whole[1]
+    active = plistlib.loads(run(["/usr/sbin/diskutil", "list", "-plist"]).stdout.encode())
+    names = active.get("AllDisks") if isinstance(active, dict) else None
+    if not isinstance(names, list) or not names or any(not isinstance(item, str) for item in names):
+        raise RuntimeError("Active disk inventory did not establish previous device absence")
+    if name in names or whole in names:
+        raise RuntimeError("Previous device is still in the active disk inventory; mount unchanged")
+    media = registry_media(plistlib.loads(run(["/usr/sbin/ioreg", "-r", "-c", "IOMedia", "-a"]).stdout.encode()))
+    matches = {target: [(identity, entry) for identity, entry in media.items()
+                        if entry["values"]["BSD Name"] == target] for target in (name, whole)}
+    if any(len(entries) != 1 for entries in matches.values()):
+        raise RuntimeError("Previous IOMedia parent/partition identity is missing or ambiguous")
+    partition_id, partition_entry = matches[name][0]
+    parent_id, parent_entry = matches[whole][0]
+    partition, parent = partition_entry["values"], parent_entry["values"]
+    if partition_entry["parents"] != {parent_id}:
+        raise RuntimeError("Previous IOMedia partition ancestry is missing or ambiguous")
+    for value in (partition, parent):
+        state = value["IOServiceState"]
+        # XNU IOKit/IOService.h: inactive=1, registered=2, matched=4.
+        if (value["IOObjectClass"] != "IOMedia" or type(state) is not int or state < 0
+                or not state & 1 or state & (2 | 4)):
+            raise RuntimeError("Previous IOMedia is active or its inactive state is unverified")
+        if (type(value["BSD Major"]) is not int or type(value["BSD Minor"]) is not int
+                or value["BSD Major"] < 0 or value["BSD Minor"] < 0):
+            raise RuntimeError("Previous IOMedia device numbers are invalid")
+    if (partition["Whole"] is not False or parent["Whole"] is not True
+            or type(partition["Size"]) is not int or type(parent["Size"]) is not int
+            or partition["Size"] != selection["partition_bytes"] or parent["Size"] != selection["whole_bytes"]
+            or canonical_uuid(partition["UUID"], "inactive partition UUID") != selection["partition_uuid"]):
+        raise RuntimeError("Previous inactive IOMedia identity does not match the saved drive")
+    numbers = (partition["BSD Major"], partition["BSD Minor"])
+    if numbers != (os.major(block.st_rdev), os.minor(block.st_rdev)):
+        raise RuntimeError("Previous device nodes no longer match inactive IOMedia device numbers")
+    if any(identity != partition_id and (entry["values"]["BSD Major"], entry["values"]["BSD Minor"]) == numbers
+           for identity, entry in media.items()):
+        raise RuntimeError("Previous device numbers were reused by another IOMedia entry")
+    return "inactive"
+
+
+def stale_receipt(record, device):
+    selection = record["selection"]
+    owned = record.get("mount")
+    if not isinstance(owned, dict):
+        raise RuntimeError("No ownership receipt for this stale mount; leaving it unchanged")
+    previous = owned.get("device")
+    if (not isinstance(previous, str) or not PARTITION.fullmatch(previous) or previous == device
+            or owned.get("mounted") is not True or owned.get("read_only") is not True
+            or owned.get("filesystem") != "ext4"
+            or not selection.get("filesystem_uuid")
+            or any(owned.get(key) != selection.get(key)
+                   for key in ("partition_uuid", "filesystem_uuid", "mountpoint"))
+            or type(owned.get("host_mount_id")) is not int or owned["host_mount_id"] <= 0):
+        raise RuntimeError("No matching ownership receipt for this stale mount; leaving it unchanged")
+    expected_source = Path(previous).name + ".local:/mnt/" + Path(selection["mountpoint"]).name
+    if owned.get("host_source") != expected_source:
+        raise RuntimeError("Stale mount source does not match its ownership receipt")
+    return owned
+
+
+def owned_stale_mount(record, device, entries):
+    """Inspect only host metadata; never contact a disconnected mount's guest."""
+    mountpoint = record["selection"]["mountpoint"]
+    mismatched = [entry for entry in entries if entry["mountpoint"] == mountpoint
+                  and entry["device"] not in (device, Path(device).name)]
+    if not mismatched:
+        return None
+    owned = stale_receipt(record, device)
+    previous = owned["device"]
+    entry = selected_mount(entries, previous, mountpoint)
+    if (not entry or not {"ext4", "ro", "noload"} <= entry["options"]
+            or "rw" in entry["options"]):
+        raise RuntimeError("Stale anylinuxfs mount did not confirm the owned ext4 ro,noload instance")
+    if any(item["device"] in (device, Path(device).name) for item in entries):
+        raise RuntimeError("Current drive is already mounted by another anylinuxfs instance")
+    old_device_state = previous_device_detached(previous, record["selection"])
+    if Path(mountpoint).is_symlink() or not os.path.ismount(mountpoint):
+        raise RuntimeError("Stale host mount is not the owned real mount")
+    if host_mount(mountpoint) != owned["host_source"] or mount_id(mountpoint) != owned["host_mount_id"]:
+        raise RuntimeError("Stale host mount no longer matches its exact ownership receipt")
+    return {"selected": True, "connected": True, "mounted": True, "stale": True, "usable": False,
+            "device": device, "current_device": device, "previous_device": previous,
+            "old_device_state": old_device_state,
+            "mountpoint": mountpoint, "partition_uuid": owned["partition_uuid"],
+            "filesystem_uuid": owned["filesystem_uuid"], "host_source": owned["host_source"],
+            "host_mount_id": owned["host_mount_id"],
+            "reconciliation_pending": bool(record.get("stale_unmount_attempt")),
+            "reopen_hint": "Run o-linux drive open to reconcile the saved read-only mount"}
+
+
+def stale_mount_gone(owned, entries):
+    previous, mountpoint = owned["device"], owned["mountpoint"]
+    return (not os.path.ismount(mountpoint) and not any(
+        entry["mountpoint"] == mountpoint or entry["device"] in (previous, Path(previous).name)
+        for entry in entries))
+
+
+def finish_stale_unmount(record):
+    record["mount"] = None
+    record.pop("stale_unmount_attempt", None)
+    save_record(record)
+
+
+def reconcile_stale_mount(app, record, device, entries):
+    """Detach only a positively identified stale instance, then allow normal open."""
+    owned = stale_receipt(record, device)
+    previous_device_detached(owned["device"], record["selection"])
+    if record.get("mount_attempt"):
+        raise RuntimeError("Prior mount completion is unknown; stale mount left unchanged")
+    require_sudo()
+    signature(device, record["selection"]["filesystem_uuid"])
+    if locate(record["selection"]) != device:
+        raise RuntimeError("Drive identity changed; stale mount left unchanged")
+    pending = record.get("stale_unmount_attempt")
+    if pending:
+        if (not isinstance(pending, dict)
+                or any(pending.get(key) != owned.get(key) for key in OWNED_MOUNT_KEYS)):
+            raise RuntimeError("Stale unmount intent does not match its ownership receipt")
+        if not stale_mount_gone(owned, parse_status(any_status(app))):
+            raise RuntimeError("Prior stale unmount completion is unknown; retaining its receipt without repeating teardown")
+        finish_stale_unmount(record)
+        return
+    if not owned_stale_mount(record, device, parse_status(any_status(app))):
+        raise RuntimeError("Stale mount changed before reconciliation; no teardown attempted")
+    record["stale_unmount_attempt"] = {**{key: owned[key] for key in OWNED_MOUNT_KEYS},
+                                        "replacement_device": device, "operation_id": uuid.uuid4().hex}
+    save_record(record)
+    try:
+        if (locate(record["selection"]) != device
+                or not owned_stale_mount(record, device, parse_status(any_status(app)))):
+            raise RuntimeError("Drive or mount identity changed")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise RuntimeError("Stale mount changed after recording intent; no teardown dispatched; "
+                           "pending intent retained: " + str(error)) from error
+    try:
+        run(["/usr/bin/sudo", "-n", app, "unmount", owned["mountpoint"], "--wait-for-vm=20"], timeout=40)
+        if not stale_mount_gone(owned, parse_status(any_status(app))):
+            raise RuntimeError("Owned stale mount is still present")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise RuntimeError("Stale unmount completion is unknown; retaining the ownership receipt and pending intent: "
+                           + str(error)) from error
+    finish_stale_unmount(record)
+
+
 def operate(args):
     if args.action == "select":
-        if (state_dir() / "drives.json").exists() and load_record().get("mount_attempt"):
+        if ((state_dir() / "drives.json").exists()
+                and any(load_record().get(key) for key in ("mount_attempt", "stale_unmount_attempt"))):
             raise RuntimeError("A prior mount is pending; reconcile with open/status before changing selection")
         selection = selection_for(args.device, args.mountpoint)
         record = {"version": 1, "selection": selection, "mount": None}
@@ -417,10 +624,22 @@ def operate(args):
     app = command("anylinuxfs", load_config())
     status = any_status(app)
     mountpoint = selection["mountpoint"]
-    active = selected_mount(parse_status(status), device, mountpoint)
+    entries = parse_status(status)
+    stale = owned_stale_mount(record, device, entries)
+    if stale and args.action == "status":
+        return stale
+    if stale or record.get("stale_unmount_attempt"):
+        if args.action == "open":
+            reconcile_stale_mount(app, record, device, entries)
+            status = any_status(app)
+            entries = parse_status(status)
+        elif args.action != "status":
+            raise RuntimeError("Saved mount is stale; run o-linux drive open to reconcile it")
+    active = selected_mount(entries, device, mountpoint)
     if args.action == "status" and not active and not os.path.ismount(mountpoint):
         return {"selected": True, "connected": True, "mounted": False, "device": device,
-                "selection": selection, "mount_pending": bool(record.get("mount_attempt"))}
+                "selection": selection, "mount_pending": bool(record.get("mount_attempt")),
+                "reconciliation_pending": bool(record.get("stale_unmount_attempt"))}
     require_sudo()
     if args.action == "open" and not active:
         if record.get("mount_attempt"):

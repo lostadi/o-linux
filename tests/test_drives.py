@@ -3,7 +3,10 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
+import plistlib
+import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -27,6 +30,32 @@ def disk_fixture(number=9, *, uuid=PARTITION_UUID, partition_bytes=1000, whole_b
                     "WholeDisk": False, "Internal": internal, "ParentWholeDisk": whole,
                     "DiskUUID": uuid, "VolumeUUID": FILESYSTEM_UUID, "TotalSize": partition_bytes},
     }
+
+
+def inactive_media_fixture():
+    """ioreg emits overlapping roots and intermediate non-IOMedia children."""
+    roots = []
+    for number, base_id, state, minor in ((9, 100, 1, 22), (12, 200, 30, 23)):
+        partition = {"BSD Major": 1, "BSD Minor": minor, "BSD Name": f"disk{number}s3",
+                     "IOObjectClass": "IOMedia", "IORegistryEntryID": base_id + 3,
+                     "IOServiceState": state, "Size": 1000, "UUID": PARTITION_UUID.upper(), "Whole": False,
+                     "IORegistryEntryChildren": [{"IOObjectClass": "IOMediaBSDClient",
+                                                  "IORegistryEntryID": base_id + 4, "IOServiceState": state}]}
+        whole = {"BSD Major": 1, "BSD Minor": 20, "BSD Name": f"disk{number}",
+                 "IOObjectClass": "IOMedia", "IORegistryEntryID": base_id,
+                 "IOServiceState": state, "Size": 2000, "Whole": True,
+                 "IORegistryEntryChildren": [{"IOObjectClass": "IOGUIDPartitionScheme",
+                                              "IORegistryEntryID": base_id + 1, "IOServiceState": state,
+                                              "IORegistryEntryChildren": [partition]}]}
+        roots.extend([whole, copy.deepcopy(partition)])
+    return roots
+
+
+def change_media(document, name, key, value):
+    for node in document:
+        if node.get("BSD Name") == name:
+            node[key] = value
+        change_media(node.get("IORegistryEntryChildren", []), name, key, value)
 
 
 class DriveTests(unittest.TestCase):
@@ -195,6 +224,37 @@ class DriveTests(unittest.TestCase):
         self.assertNotIn("Traceback", errors.getvalue())
         self.assertEqual(run.call_args.args[0], ["/usr/bin/sudo", "-n", "/usr/bin/true"])
 
+    def test_interactive_authorization_runs_in_caller_terminal_and_rechecks(self):
+        for stream in (drives.sys.stdin, drives.sys.stdout, drives.sys.stderr):
+            patch.object(stream, "isatty", return_value=True).start()
+        with patch.object(drives, "run", side_effect=[SimpleNamespace(returncode=1),
+                                                     SimpleNamespace(returncode=0)]) as probe, \
+                patch.object(drives.subprocess, "call", return_value=0) as authenticate:
+            drives.require_sudo()
+        authenticate.assert_called_once_with(["/usr/bin/sudo", "-v"])
+        self.assertEqual(probe.call_count, 2)
+
+    def test_authorization_never_prompts_captured_streams_and_does_not_accept_failed_auth(self):
+        for terminals, authenticate_code, final_code in (((True, False, True), 0, 0),
+                                                         ((True, True, True), 1, 0),
+                                                         ((True, True, True), 0, 1)):
+            with self.subTest(terminals=terminals, authenticate_code=authenticate_code, final_code=final_code), \
+                    contextlib.ExitStack() as stack:
+                for stream, terminal in zip((drives.sys.stdin, drives.sys.stdout, drives.sys.stderr), terminals):
+                    stack.enter_context(patch.object(stream, "isatty", return_value=terminal))
+                stack.enter_context(patch.object(drives, "run", side_effect=[SimpleNamespace(returncode=1),
+                                                                            SimpleNamespace(returncode=final_code)]))
+                authenticate = stack.enter_context(patch.object(drives.subprocess, "call", return_value=authenticate_code))
+                with self.assertRaisesRegex(RuntimeError, "macOS authorization required"):
+                    drives.require_sudo()
+                self.assertEqual(authenticate.call_count, int(all(terminals)))
+
+    def test_cached_authorization_never_prompts(self):
+        with patch.object(drives, "run", return_value=SimpleNamespace(returncode=0)), \
+                patch.object(drives.subprocess, "call") as authenticate:
+            drives.require_sudo()
+        authenticate.assert_not_called()
+
     def test_uncertain_mount_attempt_retains_record_and_never_unmounts(self):
         self.record()
         observed = []
@@ -324,6 +384,342 @@ class DriveTests(unittest.TestCase):
             receipt = drives.verify_mount("/tools/anylinuxfs", self.selection(), "/dev/disk9s3")
         self.assertEqual(receipt["mountpoint"], self.mountpoint)
         self.assertEqual(receipt["host_source"], "disk9s3.local:/mnt/Copy on Backup")
+
+    @contextlib.contextmanager
+    def stale_environment(self):
+        evidence = self.evidence()
+        owned = {"mounted": True, "read_only": True, "device": "/dev/disk9s3",
+                 "mountpoint": self.mountpoint, "partition_uuid": PARTITION_UUID,
+                 "filesystem_uuid": FILESYSTEM_UUID, "filesystem": "ext4",
+                 "host_source": "disk9s3.local:/mnt/" + Path(self.mountpoint).name,
+                 "host_mount_id": 77}
+        self.record(owned)
+        self.metadata = disk_fixture(12)
+        state = {"phase": "stale", "failure": None, "host_mount_id": 77,
+                 "present_nodes": set(), "inaccessible_nodes": set(), "events": [],
+                 "inactive_nodes": False, "registry": inactive_media_fixture(),
+                 "active_disks": ["disk12", "disk12s3"],
+                 "unrelated": "disk8s2 on /Volumes/Unrelated (ext4, ro, noload)",
+                 "evidence": evidence}
+        original_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if str(path) in ("/dev/disk9s3", "/dev/rdisk9s3"):
+                if str(path) in state["inaccessible_nodes"]:
+                    raise PermissionError(str(path))
+                if state["inactive_nodes"]:
+                    mode = stat.S_IFCHR if str(path) == "/dev/rdisk9s3" else stat.S_IFBLK
+                    return SimpleNamespace(st_mode=mode | 0o640, st_rdev=os.makedev(1, 22))
+                if str(path) not in state["present_nodes"]:
+                    raise FileNotFoundError(str(path))
+                return SimpleNamespace(st_mode=0)
+            return original_lstat(path, *args, **kwargs)
+
+        def status(app):
+            row = evidence["status"] if state["phase"] == "stale" else (
+                evidence["status"].replace("disk9s3", "disk12s3") if state["phase"] == "fresh" else "")
+            return "\n".join(filter(None, (row, state["unrelated"])))
+
+        def external(argv, **kwargs):
+            state["events"].append(argv)
+            if argv == ["/usr/sbin/diskutil", "list", "-plist"]:
+                return SimpleNamespace(returncode=0, stdout=plistlib.dumps({"AllDisks": state["active_disks"]}).decode(), stderr="")
+            if argv == ["/usr/sbin/ioreg", "-r", "-c", "IOMedia", "-a"]:
+                return SimpleNamespace(returncode=0, stdout=plistlib.dumps(state["registry"]).decode(), stderr="")
+            if argv == ["/sbin/mount"]:
+                text = evidence["host"]
+                if state["phase"] == "fresh":
+                    text = text.replace("disk9s3", "disk12s3")
+                return SimpleNamespace(returncode=0, stdout=text, stderr="")
+            if "unmount" in argv:
+                self.assertEqual(argv, ["/usr/bin/sudo", "-n", "/tools/anylinuxfs", "unmount",
+                                        self.mountpoint, "--wait-for-vm=20"])
+                saved = drives.load_record()
+                self.assertEqual(saved["stale_unmount_attempt"]["host_mount_id"], 77)
+                self.assertEqual(saved["mount"]["device"], "/dev/disk9s3")
+                self.assertTrue(any(item == ["signature", "/dev/disk12s3"] for item in state["events"]))
+                if state["failure"] == "busy":
+                    raise RuntimeError("unmount busy")
+                if state["failure"] != "still-mounted":
+                    state["phase"] = "absent"
+                if state["failure"] == "lost-response":
+                    raise RuntimeError("unmount response lost")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:4] == ["/usr/bin/sudo", "-n", "/tools/anylinuxfs", "disk12s3"]:
+                saved = drives.load_record()
+                self.assertIsNone(saved["mount"])
+                self.assertNotIn("stale_unmount_attempt", saved)
+                self.assertEqual(saved["mount_attempt"]["device"], "/dev/disk12s3")
+                self.assertEqual(state["phase"], "absent")
+                state["phase"] = "fresh"
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:4] == ["/usr/bin/sudo", "-n", "/bin/mkdir", "-p"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv == ["/tools/anylinuxfs", "--version"]:
+                return SimpleNamespace(returncode=0, stdout="anylinuxfs 0.20.1\n", stderr="")
+            raise AssertionError("Unexpected operation: " + repr(argv))
+
+        def signature(device, expected):
+            self.assertEqual((device, expected), ("/dev/disk12s3", FILESYSTEM_UUID))
+            state["events"].append(["signature", device])
+            return FILESYSTEM_UUID
+
+        with patch.object(drives, "inventory", side_effect=self.identifiers), \
+                patch.object(drives.os, "lstat", side_effect=lstat), \
+                patch.object(drives, "any_status", side_effect=status) as statuses, \
+                patch.object(drives, "run", side_effect=external), \
+                patch.object(drives.os.path, "ismount", side_effect=lambda path: state["phase"] != "absent"), \
+                patch.object(drives, "mount_id", side_effect=lambda path: state["host_mount_id"]), \
+                patch.object(drives, "require_sudo") as sudo, \
+                patch.object(drives, "signature", side_effect=signature) as physical, \
+                patch.object(drives, "guest_text", side_effect=lambda app, point, argv: evidence[tuple(argv)]):
+            state.update(statuses=statuses, sudo=sudo, signature=physical)
+            yield state
+
+    def test_stale_status_reports_renumbered_drive_without_probes_or_mutation(self):
+        with self.stale_environment() as state:
+            before = (self.state / "drives.json").read_bytes()
+            result = drives.dispatch(["status"])
+            self.assertTrue(result["stale"])
+            self.assertFalse(result["usable"])
+            self.assertEqual(result["current_device"], "/dev/disk12s3")
+            self.assertEqual(result["previous_device"], "/dev/disk9s3")
+            self.assertEqual(result["old_device_state"], "absent")
+            self.assertIn("o-linux drive open", result["reopen_hint"])
+            self.assertEqual((self.state / "drives.json").read_bytes(), before)
+            state["signature"].assert_not_called()
+            state["sudo"].assert_not_called()
+            self.assertEqual(state["events"], [["/sbin/mount"]])
+
+    def test_stale_open_detaches_only_exact_owned_instance_before_reopening(self):
+        with self.stale_environment() as state:
+            result = drives.dispatch(["open"])
+            record = drives.load_record()
+        self.assertTrue(result["read_only"])
+        self.assertEqual(result["device"], "/dev/disk12s3")
+        self.assertEqual(record["mount"]["device"], "/dev/disk12s3")
+        self.assertNotIn("stale_unmount_attempt", record)
+        self.assertNotIn("mount_attempt", record)
+        self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+        self.assertFalse(any("--force" in item for item in state["events"]))
+
+    def test_stale_receipt_mismatches_never_trigger_teardown(self):
+        changes = [("partition_uuid", "66666666-7777-8888-9999-000000000000"),
+                   ("filesystem_uuid", "66666666-7777-8888-9999-000000000000"),
+                   ("host_source", "other.local:/mnt/Fixture-ReadOnly"), ("host_mount_id", 78),
+                   ("mountpoint", "/Volumes/Other"), ("read_only", False), ("filesystem", "ext3")]
+        for key, value in changes:
+            with self.subTest(key=key), self.stale_environment() as state:
+                record = drives.load_record()
+                record["mount"][key] = value
+                drives.save_record(record)
+                with self.assertRaises(RuntimeError):
+                    drives.dispatch(["open"])
+                self.assertEqual(drives.load_record(), record)
+                self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.metadata = disk_fixture()
+
+    def test_existing_or_inaccessible_previous_nodes_prevent_teardown(self):
+        for key, node in (("present_nodes", "/dev/disk9s3"), ("present_nodes", "/dev/rdisk9s3"),
+                          ("inaccessible_nodes", "/dev/disk9s3")):
+            with self.subTest(key=key, node=node), self.stale_environment() as state:
+                state[key].add(node)
+                with self.assertRaisesRegex(RuntimeError, "drive node"):
+                    drives.dispatch(["open"])
+                self.assertFalse(any("unmount" in item for item in state["events"]))
+                self.assertNotIn("stale_unmount_attempt", drives.load_record())
+            self.metadata = disk_fixture()
+
+    def test_stale_mount_flags_and_host_source_must_match(self):
+        for field, replacement in (("status", self.evidence()["status"].replace("ro, noload", "rw")),
+                                   ("host", self.evidence()["host"].replace("disk9s3.local", "other.local"))):
+            with self.subTest(field=field), self.stale_environment() as state:
+                state["evidence"][field] = replacement
+                with self.assertRaises(RuntimeError):
+                    drives.dispatch(["open"])
+                self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.metadata = disk_fixture()
+
+    def test_current_physical_signature_mismatch_leaves_stale_mount_untouched(self):
+        with self.stale_environment() as state:
+            state["signature"].side_effect = RuntimeError("Filesystem signature UUID changed")
+            with self.assertRaisesRegex(RuntimeError, "signature UUID changed"):
+                drives.dispatch(["open"])
+            self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.assertNotIn("stale_unmount_attempt", drives.load_record())
+
+    def test_unknown_teardown_is_recorded_and_never_repeated_while_mount_remains(self):
+        for failure in ("busy", "still-mounted"):
+            with self.subTest(failure=failure), self.stale_environment() as state:
+                state["failure"] = failure
+                with self.assertRaisesRegex(RuntimeError, "completion is unknown"):
+                    drives.dispatch(["open"])
+                saved = drives.load_record()
+                self.assertIn("stale_unmount_attempt", saved)
+                self.assertEqual(saved["mount"]["device"], "/dev/disk9s3")
+                with self.assertRaisesRegex(RuntimeError, "without repeating teardown"):
+                    drives.dispatch(["open"])
+                self.assertEqual(drives.load_record(), saved)
+                self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+                result = drives.dispatch(["status"])
+                self.assertTrue(result["reconciliation_pending"])
+            self.metadata = disk_fixture()
+
+    def test_unknown_teardown_resumes_only_after_confirmed_disappearance(self):
+        with self.stale_environment() as state:
+            state["failure"] = "lost-response"
+            with self.assertRaisesRegex(RuntimeError, "completion is unknown"):
+                drives.dispatch(["open"])
+            self.assertIn("stale_unmount_attempt", drives.load_record())
+            result = drives.dispatch(["status"])
+            self.assertFalse(result["mounted"])
+            self.assertTrue(result["reconciliation_pending"])
+            self.assertIn("stale_unmount_attempt", drives.load_record())
+            result = drives.dispatch(["open"])
+            self.assertTrue(result["read_only"])
+            self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+            self.assertNotIn("stale_unmount_attempt", drives.load_record())
+
+    def test_failed_intent_write_prevents_teardown(self):
+        with self.stale_environment() as state, \
+                patch.object(drives, "save_record", side_effect=OSError("disk full")), \
+                self.assertRaisesRegex(OSError, "disk full"):
+            drives.dispatch(["open"])
+        self.assertFalse(any("unmount" in item for item in state["events"]))
+        self.assertNotIn("stale_unmount_attempt", drives.load_record())
+
+    def test_ownership_changed_during_intent_write_prevents_teardown(self):
+        with self.stale_environment() as state:
+            save = drives.save_record
+            def change_mount(record):
+                save(record)
+                state["host_mount_id"] = 99
+            with patch.object(drives, "save_record", side_effect=change_mount), \
+                    self.assertRaisesRegex(RuntimeError, "no teardown dispatched"):
+                drives.dispatch(["open"])
+            self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.assertIn("stale_unmount_attempt", drives.load_record())
+
+    def test_pending_recovery_refreshes_status_after_physical_preflight(self):
+        with self.stale_environment() as state:
+            state["failure"] = "lost-response"
+            with self.assertRaisesRegex(RuntimeError, "completion is unknown"):
+                drives.dispatch(["open"])
+            physical = state["signature"].side_effect
+            def reappear(device, expected):
+                result = physical(device, expected)
+                state["phase"] = "stale"
+                return result
+            state["signature"].side_effect = reappear
+            with self.assertRaisesRegex(RuntimeError, "without repeating teardown"):
+                drives.dispatch(["open"])
+            self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+            self.assertIn("stale_unmount_attempt", drives.load_record())
+
+    def test_inactive_retained_nodes_report_stale_and_reconcile_without_old_device_reads(self):
+        with self.stale_environment() as state:
+            state["inactive_nodes"] = True
+            before = (self.state / "drives.json").read_bytes()
+            result = drives.dispatch(["status"])
+            self.assertEqual(result["old_device_state"], "inactive")
+            self.assertTrue(result["stale"])
+            self.assertFalse(result["usable"])
+            self.assertEqual((self.state / "drives.json").read_bytes(), before)
+            state["signature"].assert_not_called()
+            state["sudo"].assert_not_called()
+            result = drives.dispatch(["open"])
+            self.assertTrue(result["read_only"])
+            self.assertEqual(result["device"], "/dev/disk12s3")
+            self.assertEqual(sum("unmount" in item for item in state["events"]), 1)
+            self.assertFalse(any("/dev/disk9s3" in item or "/dev/rdisk9s3" in item for item in state["events"]))
+
+    def test_inactive_media_requires_exact_state_identity_type_and_device_numbers(self):
+        mutations = [("disk9s3", "IOServiceState", 30, "inactive state"),
+                     ("disk9", "IOServiceState", 30, "inactive state"),
+                     ("disk9s3", "IOServiceState", 3, "inactive state"),
+                     ("disk9s3", "IOServiceState", 5, "inactive state"),
+                     ("disk9s3", "IOServiceState", True, "inactive state"),
+                     ("disk9s3", "UUID", "66666666-7777-8888-9999-000000000000", "identity"),
+                     ("disk9s3", "Size", 999, "identity"), ("disk9", "Size", 1999, "identity"),
+                     ("disk9s3", "Whole", True, "identity"), ("disk9", "Whole", False, "identity"),
+                     ("disk9s3", "IOObjectClass", "Other", "inactive state"),
+                     ("disk9s3", "BSD Major", 2, "device numbers"),
+                     ("disk9s3", "BSD Minor", 23, "device numbers"),
+                     ("disk9s3", "BSD Major", True, "device numbers")]
+        for name, key, value, error in mutations:
+            with self.subTest(name=name, key=key, value=value), self.stale_environment() as state:
+                state["inactive_nodes"] = True
+                change_media(state["registry"], name, key, value)
+                with self.assertRaisesRegex(RuntimeError, error):
+                    drives.dispatch(["open"])
+                self.assertFalse(any("unmount" in item for item in state["events"]))
+                self.assertNotIn("stale_unmount_attempt", drives.load_record())
+            self.metadata = disk_fixture()
+
+    def test_retained_node_pair_rejects_symlinks_nondevices_missing_and_reused_rdev(self):
+        fixtures = [(stat.S_IFLNK, stat.S_IFCHR, 22, 22), (stat.S_IFREG, stat.S_IFCHR, 22, 22),
+                    (stat.S_IFCHR, stat.S_IFBLK, 22, 22), (stat.S_IFBLK, stat.S_IFCHR, 22, 23),
+                    (stat.S_IFBLK, None, 22, 22)]
+        selected = self.selection()
+        for block_type, raw_type, block_minor, raw_minor in fixtures:
+            with self.subTest(fixture=(block_type, raw_type, block_minor, raw_minor)):
+                def node(path):
+                    mode, minor = (raw_type, raw_minor) if str(path).startswith("/dev/r") else (block_type, block_minor)
+                    if mode is None:
+                        raise FileNotFoundError(str(path))
+                    return SimpleNamespace(st_mode=mode, st_rdev=os.makedev(1, minor))
+                with patch.object(drives.os, "lstat", side_effect=node), \
+                        patch.object(drives, "run") as external, \
+                        self.assertRaisesRegex(RuntimeError, "matching block/raw pair"):
+                    drives.previous_device_detached("/dev/disk9s3", selected)
+                external.assert_not_called()
+
+    def test_inactive_parent_and_partition_must_be_absent_from_active_inventory(self):
+        for active_name in ("disk9", "disk9s3"):
+            with self.subTest(active_name=active_name), self.stale_environment() as state:
+                state["inactive_nodes"] = True
+                state["active_disks"].append(active_name)
+                with self.assertRaisesRegex(RuntimeError, "active disk inventory"):
+                    drives.dispatch(["open"])
+                self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.metadata = disk_fixture()
+
+    def test_inactive_registry_rejects_ambiguous_entries_conflicting_copies_and_ancestry(self):
+        for fault in ("duplicate-name", "conflicting-copy", "missing-parent", "wrong-parent", "multiple-parents", "reused-number"):
+            with self.subTest(fault=fault), self.stale_environment() as state:
+                state["inactive_nodes"] = True
+                registry = state["registry"]
+                if fault == "duplicate-name":
+                    duplicate = copy.deepcopy(registry[1])
+                    duplicate["IORegistryEntryID"] = 999
+                    registry.append(duplicate)
+                elif fault == "conflicting-copy":
+                    registry[1]["IOServiceState"] = 30
+                elif fault == "missing-parent":
+                    registry[0]["IORegistryEntryChildren"] = []
+                elif fault == "wrong-parent":
+                    registry[2]["IORegistryEntryChildren"].append(registry[0]["IORegistryEntryChildren"].pop())
+                elif fault == "multiple-parents":
+                    registry[2]["IORegistryEntryChildren"].append(copy.deepcopy(registry[0]["IORegistryEntryChildren"][0]))
+                else:
+                    change_media(registry, "disk12s3", "BSD Minor", 22)
+                with self.assertRaises(RuntimeError):
+                    drives.dispatch(["open"])
+                self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.metadata = disk_fixture()
+
+    def test_inactive_state_is_rechecked_after_durable_intent(self):
+        with self.stale_environment() as state:
+            state["inactive_nodes"] = True
+            save = drives.save_record
+            def reactivate(record):
+                save(record)
+                change_media(state["registry"], "disk9s3", "IOServiceState", 30)
+            with patch.object(drives, "save_record", side_effect=reactivate), \
+                    self.assertRaisesRegex(RuntimeError, "no teardown dispatched"):
+                drives.dispatch(["open"])
+            self.assertFalse(any("unmount" in item for item in state["events"]))
+            self.assertIn("stale_unmount_attempt", drives.load_record())
 
 
 if __name__ == "__main__":

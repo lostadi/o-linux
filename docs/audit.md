@@ -4,6 +4,9 @@ This review covered the main command and O integration, installer/adoption, both
 
 | Finding | Correction |
 | --- | --- |
+| A drive command entered inside Ubuntu reached the local macOS-only implementation. | Forward saved-drive actions through the provisioned, pinned Mac bridge to an absolute host launcher. A Darwin-only internal entry bounds forwarding; literal arguments and captured streams retain their existing transport. |
+| A guest-side privilege error suggested authorizing sudo in the wrong system. | When interactive, request authorization in the same forwarded Mac session; captured commands remain noninteractive and report the macOS requirement. |
+| A reconnected partition received a new disk number while its old read-only mount remained. | Status identifies an owned stale mount without changing it. Open requires the exact mount receipt, absent or positively identified inactive old devices and current filesystem identity before recorded, normal teardown and read-only reopening. An unresolved teardown is retained without automatic repetition. |
 | A successful NBD attachment could lose its ownership record after a timeout, failed client or malformed response. | Save host intent before attachment. Atomic guest receipts bind operation, instance, unique export, device, client PID and process start time. Reconcile the exact operation; retain unknown ownership. Cancellation tombstones prevent delayed attachment. |
 | Storage SSH-key updates could truncate unrelated authorization entries. | Use an fsynced temporary file and atomic replacement, reject symlinks/nonregular files, and preserve unrelated bytes. Injected write failures leave the original intact. |
 | A live netlink attachment outlived its recorded creator PID. | Use nbd-client's ioctl mode, which retains a live daemon, and wait for stable PID/start-time evidence. The implementation keeps PID-reuse protection. |

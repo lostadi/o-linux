@@ -4,7 +4,7 @@ These are bounded checks of the initial release, performed on 30 October 2026. T
 
 The host was an Apple Silicon Mac. The persistent guest was Ubuntu 26.04.1 on AArch64. Local tests used Python 3.15 on macOS and Python 3.14 on Ubuntu.
 
-The final suite passed **122 tests on macOS and 122 tests on Ubuntu**. The installed Mac application and `.O` integration matched all 16 corresponding repository source files byte-for-byte at the final drive check.
+The initial release suite passed **122 tests on macOS and 122 tests on Ubuntu**. The installed Mac application and `.O` integration matched all 16 corresponding repository source files byte-for-byte at that drive check.
 
 | Check | Result and scope |
 | --- | --- |
@@ -35,5 +35,17 @@ Direct privileged execution from the O Python backend failed because the macOS s
 In the final installed rerun, sudo authorization occurred in the native caller's context before an isolated Python helper allocated the PTY. The complete O-request/native-open path returned `mounted: true` and `read_only: true`, preserved the existing mount identity, and saved a completed receipt. No global sudoers or sandbox setting was changed.
 
 The native Mac bridge could list an existing read-only ext4 recovery mount. Direct access through the guest's shared `/Volumes` path returned permission denied in that installation; the host command bridge remained usable. The recovery source was not used for bridge write tests, repair, or bulk recovery scans.
+
+## Guest drive forwarding and reconnection
+
+A later Ubuntu invocation of `o-linux drive status` exposed a routing gap: the native Linux provider entered the Mac-only reader locally. The installed host and guest now forward that action through the pinned Mac bridge with an explicit Darwin-only receiving entry. The actual command, run in an Ubuntu login shell with captured output, returned parseable JSON and exit status zero. The saved profile's hash stayed unchanged during status.
+
+The live drive had also reconnected under a different BSD device number while its old read-only mount remained. The initial absence-only check correctly refused the retained old device nodes. Inspection showed terminated, inactive IOMedia records with the saved partition UUID and sizes. The final implementation classified those records using inactive state, registry ancestry, device-number binding and exclusion from the active disk inventory.
+
+The installed `o-linux drive open`, invoked from the Ubuntu login shell, then evaluated the real `.O` declaration, retired the exact owned stale mount with normal unmount, and opened the current partition read-only in **26.54 seconds**. Physical and guest filesystem UUIDs matched; guest block, ext4 no-journal-replay, NFS export and host mount checks passed. The new mount received a completed operation receipt. A subsequent guest status call passed, and the Mac bridge listed 19 top-level entries and read the 208-byte `etc/os-release` file. No filesystem repair, write probe on the recovery source, or bulk recovery scan was performed.
+
+The updated suite passed **151 tests on macOS Python 3.15, macOS Python 3.11, and Ubuntu Python 3.14**. An initial Ubuntu run exposed a test fixture that inherited group-write permission from its umask; the fixture now explicitly creates its configuration with mode 0600, preserving the production permission check. All 17 installed Mac package and `.O` files matched repository bytes during the successful live check. Independent reviews covered forwarding, host authorization, ownership checks and uncertain-completion handling.
+
+Direct guest access through the shared `/Volumes` path still returned permission denied after reconnection. The tested access route is `mac COMMAND` from Ubuntu; filesystem opening does not provide a guest block device or universal peripheral passthrough. Some host mount metadata calls can also block on an unhealthy NFS mount. Authentication prompting has fixture coverage; the live operation used already available Mac authorization.
 
 See [the review record](audit.md) for defects found before publication and the boundaries that remain.

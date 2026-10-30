@@ -42,6 +42,10 @@ def main(argv=None):
     if args[:1] == ["--version"]:
         from . import __version__
         print(__version__); return 0
+    if args[:1] == ["_host-drive"]:
+        if platform.system() != "Darwin":
+            raise RuntimeError("Host drive requests must execute on macOS; refusing to forward again")
+        args = ["drive", *args[1:]]
     if args[:1] == ["job"]:
         from .ostadix import job
         return job(args[1:])
@@ -51,6 +55,9 @@ def main(argv=None):
     config = load_config()
     provider = config.get("provider", "multipass")
     if args[:1] == ["drive"]:
+        if provider == "native" and platform.system() == "Linux":
+            from .guest_drive import forward
+            return forward(args[1:])
         if len(args) == 1 or args[1:] == ["open"]:
             from .drive_frontend import run_open
             print(json.dumps(run_open(), indent=2)); return 0
