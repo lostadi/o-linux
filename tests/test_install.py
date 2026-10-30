@@ -274,7 +274,9 @@ class InstallTests(unittest.TestCase):
             program = call.call_args.args[1]
             fixture = root / "guest"
             fixture.mkdir()
-            native_path = Path
+            # Python 3.11's abstract Path constructor consults pathlib.Path;
+            # keep the concrete class while that public name is mocked below.
+            native_path = type(root)
             def guest_path(value):
                 value = native_path(value)
                 return fixture / str(value).lstrip("/") if value.is_absolute() else value
